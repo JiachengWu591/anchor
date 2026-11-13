@@ -32,6 +32,8 @@ impl Paths {
     pub fn log_dir(&self) -> PathBuf { self.home.join("logs") }
     pub fn bin_dir(&self) -> PathBuf { self.home.join("bin") }
     pub fn browser_profile(&self, name: &str) -> PathBuf { self.home.join("browser").join(name) }
+    pub fn timeline_db(&self) -> PathBuf { self.home.join("timeline.db") }
+    pub fn agent_log(&self) -> PathBuf { self.log_dir().join("agent.log") }
 }
 
 /// 一个 sing-box 出站：除 name 外的字段原样透传给 sing-box。

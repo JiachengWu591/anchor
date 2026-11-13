@@ -191,11 +191,11 @@ pub fn run(cfg: &Config) -> Report {
 
     // 7. 守卫
     p.push(match crate::guard::status(cfg) {
-        Ok(st) if st.rules.is_empty() => probe(GUARD, "防火墙规则", St::Warn, None, "未安装：通道断开时 AI 程序可能直连（管理员运行 anchor guard install）"),
+        Ok(st) if st.rules.is_empty() => probe(GUARD, "防火墙规则", St::Warn, None, "未安装：通道断开时 AI 程序可能直连（anchor service install 后自动写入）"),
         Ok(st) if st.disabled() > 0 => probe(GUARD, "防火墙规则", St::Warn, None, format!("{} 条规则已暂停（anchor guard resume）", st.disabled())),
         Ok(st) if !st.missing.is_empty() => {
             let names: Vec<&str> = st.missing.iter().map(|t| t.label.as_str()).collect();
-            probe(GUARD, "防火墙规则", St::Warn, None, format!("未覆盖：{}（应用更新后路径会变，重新运行 anchor guard install）", names.join("、")))
+            probe(GUARD, "防火墙规则", St::Warn, None, format!("未覆盖：{}（应用更新后路径会变；特权服务 5 分钟内补上，或运行 anchor guard install）", names.join("、")))
         }
         Ok(st) => probe(GUARD, "防火墙规则", St::Pass, None, format!("{} 条规则，覆盖配置里的 {} 个程序", st.rules.len(), st.expected.len())),
         Err(e) => probe(GUARD, "防火墙规则", St::Warn, None, format!("无法读取：{e:#}")),

@@ -1,0 +1,32 @@
+[package]
+name = "anchor-cli"
+description = "AI Anchor 命令行：查状态、看时间线、管理守卫和后台进程"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "anchor"
+path = "src/main.rs"
+
+[dependencies]
+anchor-core = { workspace = true, features = ["timeline"] }
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+humantime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+winreg.workspace = true
+
+[dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]

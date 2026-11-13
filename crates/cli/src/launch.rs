@@ -16,7 +16,7 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// 启动前检查。不通过就不启动，返回原因。
 pub fn readiness(cfg: &Config) -> Result<String> {
     if !net::port_open(&cfg.proxy.listen, cfg.proxy.port) {
-        bail!("内核未运行（{} 没有监听）：先在另一个终端运行 anchor up", cfg.proxy_url());
+        bail!("内核未运行（{} 没有监听）：先启动 AI Anchor（anchor agent start）", cfg.proxy_url());
     }
     if cfg.expect.ip.trim().is_empty() {
         bail!("还没有登记出口基线：先运行 anchor baseline");
@@ -86,9 +86,11 @@ pub fn launch_desktop(cfg: &Config, id: &str) -> Result<()> {
         bail!("{} 已在运行。请先完全退出它（包括系统托盘图标），再用 anchor launch 启动，否则代理参数不会生效。", app.label);
     }
     let ip = readiness(cfg)?;
+    // 应用可能刚更新：先请特权服务刷新一次守卫，再检查覆盖情况
+    crate::svcctl::refresh_before_launch(app.label);
     match guard::status(cfg) {
         Ok(st) if !st.covers(&app.exe) => {
-            eprintln!("警告：{} 没有守卫规则，通道断开时它可能直连。管理员终端运行 anchor guard install 可补上。", app.label)
+            eprintln!("警告：{} 没有守卫规则，通道断开时它可能直连。运行 anchor guard install 可补上。", app.label)
         }
         Err(e) => eprintln!("警告：无法读取守卫状态：{e:#}"),
         _ => {}
@@ -98,6 +100,7 @@ pub fn launch_desktop(cfg: &Config, id: &str) -> Result<()> {
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .with_context(|| format!("无法启动 {}", app.launcher.display()))?;
+    crate::agentctl::record("app_launch", serde_json::json!({ "app": id, "exe": app.exe }));
     println!("已启动 {}：经 {} 联网，出口 {ip}。", app.label, cfg.proxy_url());
     Ok(())
 }
@@ -148,6 +151,7 @@ pub fn launch_browser(cfg: &Config, paths: &Paths, url: Option<&str>) -> Result<
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
         .spawn()
         .with_context(|| format!("无法启动 {}", exe.display()))?;
+    crate::agentctl::record("app_launch", serde_json::json!({ "app": "browser", "exe": exe }));
     println!("已打开 AI 专用浏览器（{}），出口 {ip}，配置目录 {}。", exe.display(), paths.browser_profile(&cfg.browser.profile).display());
     Ok(())
 }
