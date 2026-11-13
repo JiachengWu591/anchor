@@ -1,0 +1,22 @@
+[package]
+name = "ai-anchor"
+version = "0.1.0"
+edition = "2024"
+description = "AI Anchor P0 原型：让 AI 程序走固定出口，通道不可用时阻断而不是直连"
+publish = false
+
+[[bin]]
+name = "anchor"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+toml_edit = "0.22"
+ureq = "2"
