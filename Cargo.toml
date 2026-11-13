@@ -3,6 +3,7 @@ name = "ai-anchor"
 version = "0.1.0"
 edition = "2024"
 description = "AI Anchor P0 原型：让 AI 程序走固定出口，通道不可用时阻断而不是直连"
+license = "MIT"
 publish = false
 
 [[bin]]
