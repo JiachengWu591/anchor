@@ -2,14 +2,16 @@
 //! sing-box 是 GPL-3.0，只作为独立程序调用，不链接其代码。
 
 use crate::config::{Config, Paths, host_port};
-use crate::{net, singbox};
+use crate::{net, singbox, win};
 use anyhow::{Context, Result, bail};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
+
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn find_singbox(cfg: &Config, paths: &Paths) -> Result<PathBuf> {
     if !cfg.core.path.trim().is_empty() {
@@ -85,44 +87,75 @@ mod tests {
     }
 }
 
-/// 前台运行并守护内核；Ctrl+C 退出。P1 起改为 Windows 服务。
-pub fn up(cfg: &Config, paths: &Paths) -> Result<()> {
+/// 内核状态变化，由 supervise 回调报告。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KernelEvent {
+    /// 启动；listening 表示 5 秒内开始监听 AI 端口
+    Started { pid: u32, listening: bool },
+    /// 意外退出，restart_in 之后重启
+    Exited { pid: u32, code: Option<i32>, uptime: Duration, restart_in: Duration },
+    /// 意外退出后重新开始监听；down 从第一次退出算起
+    Recovered { pid: u32, code: Option<i32>, uptime: Duration, down: Duration },
+    /// 收到停止信号，内核已停止
+    Stopped,
+}
+
+/// 预检：找到 sing-box，写入并校验配置，确认 AI 端口空闲。返回 (sing-box 路径, 配置路径)。
+pub fn prepare(cfg: &Config, paths: &Paths) -> Result<(PathBuf, PathBuf)> {
     let sb = find_singbox(cfg, paths)?;
     let json = write_config(cfg, paths)?;
     check_config(&sb, &json)?;
-    let listen = host_port(&cfg.proxy.listen, cfg.proxy.port);
     if net::port_open(&cfg.proxy.listen, cfg.proxy.port) {
-        bail!("{listen} 已被占用：可能已经有一个 anchor up 在运行，或被其他程序占用");
+        bail!(
+            "{} 已被占用：可能已经有 anchor-agent 或 anchor up 在运行，或被其他程序占用",
+            host_port(&cfg.proxy.listen, cfg.proxy.port)
+        );
     }
+    Ok((sb, json))
+}
 
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let s = stop.clone();
-        ctrlc::set_handler(move || s.store(true, Ordering::SeqCst)).context("无法注册 Ctrl+C 处理")?;
-    }
+pub struct Options {
+    /// 后台运行：不弹控制台窗口，停止时直接结束进程
+    pub background: bool,
+}
 
-    if let Some(every) = crate::watch::spawn(cfg, stop.clone()) {
-        println!("线路看门狗：每 {} 探测当前线路，失败时立即重新选线。", humantime::format_duration(every));
-    }
-
-    let log = paths.log_dir().join("sing-box.log");
+/// 运行并守护内核，直到 stop 置位。意外退出后按 1、2、4…30 秒退避重启；稳定运行 60 秒后退避清零。
+/// 内核放在“关闭即结束”的作业对象里：调用方进程被强制结束时，内核随之退出，不会占着端口。
+pub fn supervise(
+    cfg: &Config,
+    paths: &Paths,
+    sb: &Path,
+    json: &Path,
+    stop: &AtomicBool,
+    opts: &Options,
+    on: &mut dyn FnMut(KernelEvent),
+) -> Result<()> {
+    let job = win::KillOnClose::new().ok();
     let mut backoff = 1u64;
+    // 第一次意外退出的时间、退出码和运行时长；恢复监听后清空
+    let mut crashed: Option<(Instant, Option<i32>, Duration)> = None;
     loop {
         let started = Instant::now();
-        let mut child = Command::new(&sb)
-            .arg("run")
-            .arg("-c")
-            .arg(&json)
-            .arg("-D")
-            .arg(paths.run_dir())
-            .spawn()
-            .with_context(|| format!("无法启动 {}", sb.display()))?;
-        let _ = std::fs::write(paths.pid_file(), child.id().to_string());
+        let mut cmd = Command::new(sb);
+        cmd.arg("run").arg("-c").arg(json).arg("-D").arg(paths.run_dir());
+        if opts.background {
+            cmd.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        let mut child = cmd.spawn().with_context(|| format!("无法启动 {}", sb.display()))?;
+        if let Some(j) = &job {
+            let _ = j.assign(&child);
+        }
+        let pid = child.id();
+        let _ = std::fs::write(paths.pid_file(), pid.to_string());
 
-        if wait_port(cfg, &mut child, Duration::from_secs(5)) {
-            println!("内核已启动（pid {}）：AI 代理端口 {listen}，日志 {}。按 Ctrl+C 停止。", child.id(), log.display());
-        } else {
-            eprintln!("内核 5 秒内没有开始监听，查看日志：{}", log.display());
+        let listening = wait_port(cfg, &mut child, Duration::from_secs(5));
+        match crashed {
+            Some((at, code, uptime)) if listening => {
+                on(KernelEvent::Recovered { pid, code, uptime, down: at.elapsed() });
+                crashed = None;
+            }
+            Some(_) => {}
+            None => on(KernelEvent::Started { pid, listening }),
         }
 
         let status = loop {
@@ -130,10 +163,12 @@ pub fn up(cfg: &Config, paths: &Paths) -> Result<()> {
                 break st;
             }
             if stop.load(Ordering::SeqCst) {
-                // 同一控制台里 sing-box 也会收到 Ctrl+C，给它 3 秒自行退出。
-                let deadline = Instant::now() + Duration::from_secs(3);
-                while Instant::now() < deadline && child.try_wait()?.is_none() {
-                    sleep(Duration::from_millis(100));
+                if !opts.background {
+                    // 同一控制台里 sing-box 也会收到 Ctrl+C，给它 3 秒自行退出。
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while Instant::now() < deadline && child.try_wait()?.is_none() {
+                        sleep(Duration::from_millis(100));
+                    }
                 }
                 if child.try_wait()?.is_none() {
                     let _ = child.kill();
@@ -145,20 +180,26 @@ pub fn up(cfg: &Config, paths: &Paths) -> Result<()> {
 
         if stop.load(Ordering::SeqCst) {
             let _ = std::fs::remove_file(paths.pid_file());
-            println!("内核已停止。守卫规则仍然有效：AI 程序此时没有网络，不会直连。");
+            on(KernelEvent::Stopped);
             return Ok(());
         }
-        if started.elapsed() > Duration::from_secs(60) {
+        let uptime = started.elapsed();
+        if uptime > Duration::from_secs(60) {
             backoff = 1;
         }
-        eprintln!("内核意外退出（{status}），{backoff} 秒后重启。日志：{}", log.display());
+        let code = status.code();
+        if crashed.is_none() {
+            crashed = Some((Instant::now(), code, uptime));
+        }
+        on(KernelEvent::Exited { pid, code, uptime, restart_in: Duration::from_secs(backoff) });
         let until = Instant::now() + Duration::from_secs(backoff);
         while Instant::now() < until {
             if stop.load(Ordering::SeqCst) {
                 let _ = std::fs::remove_file(paths.pid_file());
+                on(KernelEvent::Stopped);
                 return Ok(());
             }
-            sleep(Duration::from_millis(200));
+            sleep(Duration::from_millis(100));
         }
         backoff = (backoff * 2).min(30);
     }
@@ -173,7 +214,7 @@ fn wait_port(cfg: &Config, child: &mut Child, timeout: Duration) -> bool {
         if child.try_wait().ok().flatten().is_some() {
             return false;
         }
-        sleep(Duration::from_millis(200));
+        sleep(Duration::from_millis(100));
     }
     false
 }

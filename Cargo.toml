@@ -1,23 +1,27 @@
-[package]
-name = "ai-anchor"
-version = "0.1.0"
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/cli", "crates/agent", "crates/svc"]
+
+[workspace.package]
+version = "0.2.0"
 edition = "2024"
-description = "AI Anchor P0 原型：让 AI 程序走固定出口，通道不可用时阻断而不是直连"
 license = "MIT"
 publish = false
 
-[[bin]]
-name = "anchor"
-path = "src/main.rs"
-
-[dependencies]
+[workspace.dependencies]
+anchor-core = { path = "crates/core" }
 anyhow = "1"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 ctrlc = "3"
 humantime = "2"
+rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 toml_edit = "0.22"
 ureq = "2"
+windows-service = "0.8"
+windows-sys = "0.59"
+winreg = "0.55"

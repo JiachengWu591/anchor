@@ -1,0 +1,19 @@
+[package]
+name = "anchor-svc"
+description = "AI Anchor 特权服务：维护防火墙守卫规则，应用更新后自动刷新"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anchor-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+humantime.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+windows-service.workspace = true
+winreg.workspace = true

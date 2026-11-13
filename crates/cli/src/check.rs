@@ -41,6 +41,9 @@ pub struct Probe {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub latency_ms: Option<u64>,
     pub detail: String,
+    /// 官方状态页报告服务异常时，记下是哪家（结论里单独说明，不当作 AI Anchor 测到的故障）
+    #[serde(skip)]
+    pub outage: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,9 +64,10 @@ const AI: &str = "AI 服务";
 const CONS: &str = "一致性";
 const GUARD: &str = "守卫";
 
+/// (服务商, 状态页地址)
 const STATUS_PAGES: &[(&str, &str)] = &[
-    ("Anthropic 状态页", "https://status.anthropic.com/api/v2/status.json"),
-    ("OpenAI 状态页", "https://status.openai.com/api/v2/status.json"),
+    ("Anthropic", "https://status.anthropic.com/api/v2/status.json"),
+    ("OpenAI", "https://status.openai.com/api/v2/status.json"),
 ];
 const ENDPOINTS: &[(&str, &str)] = &[
     ("api.anthropic.com", "https://api.anthropic.com/v1/models"),
@@ -73,7 +77,7 @@ const ENDPOINTS: &[(&str, &str)] = &[
 ];
 
 fn probe(segment: &'static str, name: impl Into<String>, status: St, latency: Option<Duration>, detail: impl Into<String>) -> Probe {
-    Probe { segment, name: name.into(), status, latency_ms: latency.map(|d| d.as_millis() as u64), detail: detail.into() }
+    Probe { segment, name: name.into(), status, latency_ms: latency.map(|d| d.as_millis() as u64), detail: detail.into(), outage: None }
 }
 
 pub fn run(cfg: &Config) -> Report {
@@ -148,7 +152,8 @@ pub fn run(cfg: &Config) -> Report {
     let mut exit_info = None;
     if core_up {
         if let Ok(ms) = api.delay("exit", &cfg.switch.probe_url, 8000) {
-            p.push(Probe { latency_ms: Some(ms), ..probe(EXIT, "整条链路", St::Pass, None, "线路 → 出口 → 目标") });
+            let path = if cfg.lines.is_empty() { "出口 → 目标" } else { "线路 → 出口 → 目标" };
+            p.push(Probe { latency_ms: Some(ms), ..probe(EXIT, "整条链路", St::Pass, None, path) });
         }
         match net::agent_via_proxy(cfg, Duration::from_secs(10)).and_then(|a| net::fetch_exit(&a, &cfg.check)) {
             Ok(info) => {
@@ -172,15 +177,11 @@ pub fn run(cfg: &Config) -> Report {
     // 5. AI 服务：官方状态页 + 关键域名可达性
     match (core_up, net::agent_via_proxy(cfg, Duration::from_secs(10))) {
         (true, Ok(agent)) => {
-            for (name, url) in STATUS_PAGES {
-                p.push(status_page(&agent, name, url));
+            for (vendor, url) in STATUS_PAGES {
+                p.push(status_page(&agent, vendor, url));
             }
             for (name, url) in ENDPOINTS {
-                p.push(match net::get(&agent, url) {
-                    Ok(r) if region_blocked(&r) => probe(AI, *name, St::Warn, Some(r.elapsed), format!("HTTP {}：服务提示出口所在地区不受支持", r.code)),
-                    Ok(r) => probe(AI, *name, St::Pass, Some(r.elapsed), format!("可达（HTTP {}）", r.code)),
-                    Err(e) => probe(AI, *name, St::Fail, None, format!("{e:#}")),
-                });
+                p.push(endpoint_probe(name, net::get(&agent, url)));
             }
         }
         _ => p.push(probe(AI, "全部", St::Skip, None, "内核未运行")),
@@ -190,14 +191,9 @@ pub fn run(cfg: &Config) -> Report {
     consistency(cfg, exit_info.as_ref(), &mut p);
 
     // 7. 守卫
+    let apps_empty = cfg.apps.desktop.is_empty() && cfg.apps.cli.is_empty() && cfg.guard.extra_programs.is_empty();
     p.push(match crate::guard::status(cfg) {
-        Ok(st) if st.rules.is_empty() => probe(GUARD, "防火墙规则", St::Warn, None, "未安装：通道断开时 AI 程序可能直连（管理员运行 anchor guard install）"),
-        Ok(st) if st.disabled() > 0 => probe(GUARD, "防火墙规则", St::Warn, None, format!("{} 条规则已暂停（anchor guard resume）", st.disabled())),
-        Ok(st) if !st.missing.is_empty() => {
-            let names: Vec<&str> = st.missing.iter().map(|t| t.label.as_str()).collect();
-            probe(GUARD, "防火墙规则", St::Warn, None, format!("未覆盖：{}（应用更新后路径会变，重新运行 anchor guard install）", names.join("、")))
-        }
-        Ok(st) => probe(GUARD, "防火墙规则", St::Pass, None, format!("{} 条规则，覆盖配置里的 {} 个程序", st.rules.len(), st.expected.len())),
+        Ok(st) => guard_probe(&st, apps_empty, crate::svcctl::running()),
         Err(e) => probe(GUARD, "防火墙规则", St::Warn, None, format!("无法读取：{e:#}")),
     });
 
@@ -205,7 +201,10 @@ pub fn run(cfg: &Config) -> Report {
     Report { time: now_rfc3339(), healthy: !p.iter().any(|x| x.status == St::Fail), verdict, exit: exit_info, probes: p }
 }
 
-fn status_page(agent: &ureq::Agent, name: &str, url: &str) -> Probe {
+/// 官方状态页是服务商的公告，不是 AI Anchor 测到的故障：最多标 WARN，由结论单独说明；
+/// 能不能连上以下面的地址探测为准。
+fn status_page(agent: &ureq::Agent, vendor: &'static str, url: &str) -> Probe {
+    let name = format!("{vendor} 状态页");
     let r = match net::get(agent, url) {
         Ok(r) => r,
         Err(e) => return probe(AI, name, St::Warn, None, format!("状态页打不开：{e:#}")),
@@ -213,12 +212,60 @@ fn status_page(agent: &ureq::Agent, name: &str, url: &str) -> Probe {
     let v: Option<Value> = serde_json::from_str(&r.body).ok();
     let indicator = v.as_ref().and_then(|v| v["status"]["indicator"].as_str()).map(str::to_string);
     let desc = v.as_ref().and_then(|v| v["status"]["description"].as_str()).unwrap_or("").to_string();
-    match indicator.as_deref() {
-        Some("none") => probe(AI, name, St::Pass, Some(r.elapsed), desc),
-        Some("minor") | Some("maintenance") => probe(AI, name, St::Warn, Some(r.elapsed), desc),
-        Some(_) => probe(AI, name, St::Fail, Some(r.elapsed), format!("服务端故障：{desc}")),
-        None => probe(AI, name, St::Warn, Some(r.elapsed), format!("HTTP {}，无法解析状态", r.code)),
+    status_probe(vendor, name, indicator.as_deref(), desc, r.code, r.elapsed)
+}
+
+fn status_probe(vendor: &'static str, name: String, indicator: Option<&str>, desc: String, code: u16, elapsed: Duration) -> Probe {
+    match indicator {
+        Some("none") => probe(AI, name, St::Pass, Some(elapsed), desc),
+        Some("maintenance") => probe(AI, name, St::Warn, Some(elapsed), desc),
+        Some(level) => {
+            let detail = if level == "minor" { desc } else { format!("服务端故障：{desc}") };
+            Probe { outage: Some(vendor), ..probe(AI, name, St::Warn, Some(elapsed), detail) }
+        }
+        None => probe(AI, name, St::Warn, Some(elapsed), format!("HTTP {code}，无法解析状态")),
     }
+}
+
+fn endpoint_probe(name: &str, res: Result<net::HttpResult>) -> Probe {
+    match res {
+        Ok(r) if region_blocked(&r) => probe(AI, name, St::Warn, Some(r.elapsed), format!("HTTP {}：服务提示出口所在地区不受支持", r.code)),
+        // Cloudflare 对不像浏览器的请求要求人机验证：网络是通的，浏览器和桌面客户端一般能自动通过
+        Ok(r) if r.cf_mitigated.as_deref() == Some("challenge") => probe(
+            AI,
+            name,
+            St::Pass,
+            Some(r.elapsed),
+            format!("可达（HTTP {}：Cloudflare 要求脚本请求做人机验证，浏览器和客户端一般能自动通过）", r.code),
+        ),
+        Ok(r) => probe(AI, name, St::Pass, Some(r.elapsed), format!("可达（HTTP {}）", r.code)),
+        Err(e) => probe(AI, name, St::Fail, None, format!("{e:#}")),
+    }
+}
+
+/// 守卫一项。apps_empty：配置里没有纳入任何程序；svc：特权服务在运行。
+fn guard_probe(st: &crate::guard::GuardStatus, apps_empty: bool, svc: bool) -> Probe {
+    const NAME: &str = "防火墙规则";
+    if st.rules.is_empty() && st.expected.is_empty() {
+        return if apps_empty {
+            probe(GUARD, NAME, St::Info, None, "[apps] 里还没有程序，不需要规则（加入程序后运行 anchor guard install）")
+        } else {
+            probe(GUARD, NAME, St::Warn, None, "配置里的程序在本机都没找到，没有可守卫的（anchor scan 查看已安装的程序）")
+        };
+    }
+    if st.rules.is_empty() {
+        let fix = if svc { "运行 anchor guard install 立即写入" } else { "特权服务没有运行；anchor service install 后自动写入" };
+        return probe(GUARD, NAME, St::Warn, None, format!("还没有规则：通道断开时 AI 程序可能直连（{fix}）"));
+    }
+    if st.disabled() > 0 {
+        return probe(GUARD, NAME, St::Warn, None, format!("{} 条规则已暂停（anchor guard resume）", st.disabled()));
+    }
+    if !st.missing.is_empty() {
+        let names: Vec<&str> = st.missing.iter().map(|t| t.label.as_str()).collect();
+        let fix = if svc { "特权服务 5 分钟内补上，或运行 anchor guard install" } else { "运行 anchor guard install 补上" };
+        return probe(GUARD, NAME, St::Warn, None, format!("未覆盖：{}（应用更新后路径会变；{fix}）", names.join("、")));
+    }
+    probe(GUARD, NAME, St::Pass, None, format!("{} 条规则，覆盖配置里的 {} 个程序", st.rules.len(), st.expected.len()))
 }
 
 fn region_blocked(r: &net::HttpResult) -> bool {
@@ -269,6 +316,7 @@ fn attribute(p: &[Probe], has_lines: bool, vpn: Option<&str>) -> String {
     let vpn_down = p.iter().any(|x| x.segment == LOCAL && x.name == "VPN / 隧道" && x.status == St::Warn);
     let lines: Vec<&Probe> = p.iter().filter(|x| x.segment == LINE && x.status != St::Info).collect();
     let all_lines_down = has_lines && !lines.is_empty() && lines.iter().all(|x| x.status == St::Fail);
+    let outages: Vec<&str> = p.iter().filter_map(|x| x.outage).collect();
     if failed(LOCAL) || vpn_down {
         match vpn {
             Some(v) => format!("故障在本地网络：本机出网失败，流量经 VPN“{v}”，先检查 VPN 是否已连接，再检查 Wi-Fi / 网线"),
@@ -284,9 +332,15 @@ fn attribute(p: &[Probe], has_lines: bool, vpn: Option<&str>) -> String {
     } else if failed(EXIT) {
         "故障在出口：出口不可达，或出口 IP 已变化".into()
     } else if failed(AI) {
-        "故障在服务端，或出口到 AI 服务的路径".into()
+        if outages.is_empty() {
+            "有 AI 服务连不上，官方状态页也没有报告异常：多半是出口到 AI 服务的路径有问题，或服务拒绝了这个出口 IP".into()
+        } else {
+            format!("有 AI 服务连不上，{} 官方也报告了服务异常：多半是服务端的问题", outages.join("、"))
+        }
     } else if failed(LINE) {
         "通道可用：部分线路不可用，自动切换会避开它们".into()
+    } else if !outages.is_empty() {
+        format!("通道正常；{} 官方报告服务异常，用起来不正常时多半是服务端的问题（见 WARN）", outages.join("、"))
     } else if p.iter().any(|x| x.status == St::Warn) {
         "通道可用，有需要注意的项（见 WARN）".into()
     } else {
@@ -330,7 +384,7 @@ mod tests {
         let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(LINE, St::Pass), pr(EXIT, St::Fail)];
         assert!(attribute(&p, true, None).contains("出口"));
         let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass), pr(AI, St::Fail)];
-        assert!(attribute(&p, false, None).contains("服务端"));
+        assert!(attribute(&p, false, None).contains("路径"));
         let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass)];
         assert_eq!(attribute(&p, false, None), "全部正常");
     }
@@ -344,5 +398,87 @@ mod tests {
         // 隧道正常时，信息项不影响“全部正常”
         let p = vec![pr(LOCAL, St::Pass), probe(LOCAL, "VPN / 隧道", St::Info, None, ""), pr(CORE, St::Pass), pr(EXIT, St::Pass)];
         assert_eq!(attribute(&p, false, Some("本地连接")), "全部正常");
+    }
+
+    fn page(indicator: &str, desc: &str) -> Probe {
+        status_probe("Anthropic", "Anthropic 状态页".into(), Some(indicator), desc.into(), 200, Duration::ZERO)
+    }
+
+    #[test]
+    fn official_outage_is_a_notice_not_a_channel_failure() {
+        let major = page("major", "Partial System Outage");
+        assert_eq!(major.status, St::Warn, "状态页是公告，不算 AI Anchor 测到的故障");
+        assert_eq!(major.outage, Some("Anthropic"));
+        assert!(page("minor", "Minor Service Outage").outage.is_some());
+        assert!(page("maintenance", "Under Maintenance").outage.is_none());
+        assert_eq!(page("none", "All Systems Operational").status, St::Pass);
+
+        // 地址都能连上：通道正常，结论点名官方公告，不把故障归到通道或路径上
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass), page("major", "x"), pr(AI, St::Pass)];
+        let v = attribute(&p, false, None);
+        assert!(v.starts_with("通道正常") && v.contains("Anthropic"), "{v}");
+        let report_healthy = !p.iter().any(|x| x.status == St::Fail);
+        assert!(report_healthy);
+
+        // 地址连不上且官方报告异常：归到服务端
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass), page("major", "x"), pr(AI, St::Fail)];
+        assert!(attribute(&p, false, None).contains("服务端"));
+    }
+
+    fn http(code: u16, cf: Option<&str>) -> net::HttpResult {
+        net::HttpResult {
+            code,
+            body: String::new(),
+            final_url: "https://claude.ai/".into(),
+            elapsed: Duration::ZERO,
+            cf_mitigated: cf.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn cloudflare_challenge_is_explained() {
+        let p = endpoint_probe("claude.ai", Ok(http(403, Some("challenge"))));
+        assert_eq!(p.status, St::Pass);
+        assert!(p.detail.contains("Cloudflare"), "{}", p.detail);
+        let p = endpoint_probe("claude.ai", Ok(http(403, None)));
+        assert_eq!(p.detail, "可达（HTTP 403）");
+    }
+
+    fn rule(path: &str) -> crate::guard::RuleInfo {
+        crate::guard::RuleInfo {
+            id: "id".into(),
+            enabled: true,
+            name: "rule".into(),
+            program: path.into(),
+            description: String::new(),
+        }
+    }
+
+    fn target(path: &str) -> crate::guard::Target {
+        crate::guard::Target { label: "Claude 桌面版".into(), path: path.into() }
+    }
+
+    #[test]
+    fn guard_message_matches_the_situation() {
+        use crate::guard::status_from;
+        const EXE: &str = r"C:\Program Files\WindowsApps\Claude_1\app\Claude.exe";
+
+        // [apps] 为空：不需要规则，不提示安装服务
+        let p = guard_probe(&status_from(vec![], vec![]), true, true);
+        assert_eq!(p.status, St::Info);
+        assert!(p.detail.contains("[apps]") && !p.detail.contains("service install"), "{}", p.detail);
+
+        // 配置了程序但本机都没装
+        assert!(guard_probe(&status_from(vec![], vec![]), false, true).detail.contains("没找到"));
+
+        // 有程序、没规则：服务在运行时让用户 guard install，不在运行时才提安装服务
+        let st = status_from(vec![], vec![target(EXE)]);
+        let running = guard_probe(&st, false, true);
+        assert_eq!(running.status, St::Warn);
+        assert!(running.detail.contains("anchor guard install") && !running.detail.contains("service install"), "{}", running.detail);
+        assert!(guard_probe(&st, false, false).detail.contains("anchor service install"));
+
+        // 已覆盖
+        assert_eq!(guard_probe(&status_from(vec![rule(EXE)], vec![target(EXE)]), false, true).status, St::Pass);
     }
 }

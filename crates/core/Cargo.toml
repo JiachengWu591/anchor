@@ -1,0 +1,41 @@
+[package]
+name = "anchor-core"
+description = "AI Anchor 公共库：配置、内核配置生成、网络探测、守卫计算、本机接口、时间线"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+# 时间线（SQLite）。用户代理写、命令行读；特权服务不需要。
+timeline = ["dep:rusqlite", "dep:chrono"]
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono = { workspace = true, optional = true }
+humantime.workspace = true
+rusqlite = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
+ureq.workspace = true
+winreg.workspace = true
+
+[dependencies.windows-sys]
+workspace = true
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_Storage_Packaging_Appx",
+    "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_Pipes",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+]

@@ -5,16 +5,15 @@
 //! 连不了任何其他地址。内核没运行时，AI 程序因此没有网络，而不是直连。
 //! FakeIP 段默认不放行：它只给 AI Anchor 自己的 TUN 兜底（P1）使用，而且常与 VPN 网段重叠。
 
-use crate::apps::{self, Kind};
+use crate::apps::{self, Kind, Roots};
 use crate::config::Config;
-use crate::{netenv, ps};
 use crate::util::{confirm, exists_any, same_path};
+use crate::{netenv, ps, win};
 use anyhow::{Context, Result, bail};
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 
 pub const GROUP: &str = "AI Anchor Guard";
 
@@ -113,12 +112,13 @@ pub fn blocked_remote(fakeip: Option<&str>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Target {
     pub label: String,
     pub path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
 pub struct Plan {
     pub targets: Vec<Target>,
     /// (名称, 路径, 原因)
@@ -143,10 +143,30 @@ fn fakeip_allowance(cfg: &Config) -> Result<Option<&str>> {
 }
 
 pub fn plan(cfg: &Config) -> Result<Plan> {
+    plan_with(cfg, &Roots::current())
+}
+
+/// extra_programs 里不能守卫的路径和原因。
+fn refuse_extra(path: &Path) -> Option<String> {
+    let file = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if !path.is_absolute() {
+        return Some("必须写完整路径".into());
+    }
+    if FORBIDDEN.contains(&file.as_str()) {
+        return Some(format!("{file} 不只被 AI 使用，守卫会断掉它的日常联网"));
+    }
+    let sysroot = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    if path.to_string_lossy().to_lowercase().starts_with(&sysroot.to_string_lossy().to_lowercase()) {
+        return Some("不能守卫 Windows 目录里的系统程序".into());
+    }
+    None
+}
+
+pub fn plan_with(cfg: &Config, roots: &Roots) -> Result<Plan> {
     let enabled: HashSet<&str> = cfg.apps.desktop.iter().chain(cfg.apps.cli.iter()).map(String::as_str).collect();
     let mut targets: Vec<Target> = Vec::new();
     let mut skipped = Vec::new();
-    for f in apps::scan() {
+    for f in apps::scan_with(roots) {
         if !enabled.contains(f.id) {
             continue;
         }
@@ -162,8 +182,9 @@ pub fn plan(cfg: &Config) -> Result<Plan> {
     for p in &cfg.guard.extra_programs {
         let path = PathBuf::from(p);
         let file = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        if FORBIDDEN.contains(&file.as_str()) {
-            bail!("[guard] extra_programs 不能包含 {file}：它不只被 AI 使用，守卫会断掉它的日常联网");
+        if let Some(why) = refuse_extra(&path) {
+            skipped.push((format!("自定义：{file}"), path, format!("[guard] extra_programs：{why}")));
+            continue;
         }
         if !targets.iter().any(|t| same_path(&t.path, &path)) {
             targets.push(Target { label: format!("自定义：{file}"), path });
@@ -200,39 +221,117 @@ fn load_rules_ps() -> String {
     )
 }
 
+/// 阻断地址集合的指纹，写进规则说明。地址集合变了（例如改了 allow_fakeip），旧规则会被识别出来重建。
+pub fn fingerprint(remote: &[String]) -> String {
+    // FNV-1a 64：跨版本稳定，不依赖标准库哈希的实现
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in remote.join(",").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{:08x}", (h >> 32) as u32 ^ h as u32)
+}
+
+fn fp_tag(fp: &str) -> String {
+    format!("[fp:{fp}]")
+}
+
+fn rule_description(fp: &str) -> String {
+    format!("只允许经本机 AI 通道联网。由 AI Anchor 管理，用 anchor guard remove 移除。{}", fp_tag(fp))
+}
+
+fn new_rule_ps(t: &Target, fp: &str, enabled: bool) -> String {
+    format!(
+        "New-NetFirewallRule -DisplayName {} -Group $group -Direction Outbound -Action Block -Program {} \
+         -RemoteAddress $remote -Profile Any -Enabled {} -Description {} | Out-Null",
+        ps::quote(&format!("AI Anchor Guard: {}", t.label)),
+        ps::quote(&t.path.to_string_lossy()),
+        if enabled { "True" } else { "False" },
+        ps::quote(&rule_description(fp)),
+    )
+}
+
+fn script_header(remote: &[String]) -> String {
+    let remote: Vec<String> = remote.iter().map(|r| ps::quote(r)).collect();
+    format!("$ErrorActionPreference = 'Stop'\n$group = {}\n$remote = @({})\n", ps::quote(GROUP), remote.join(", "))
+}
+
 pub fn install_script(plan: &Plan) -> String {
-    let mut s = String::new();
-    let _ = writeln!(s, "$ErrorActionPreference = 'Stop'");
-    let _ = writeln!(s, "$group = {}", ps::quote(GROUP));
+    let fp = fingerprint(&plan.remote);
+    let mut s = script_header(&plan.remote);
     let _ = writeln!(s, "{}", load_rules_ps());
     let _ = writeln!(s, "if ($rules.Count) {{ $rules | Remove-NetFirewallRule }}");
-    let remote: Vec<String> = plan.remote.iter().map(|r| ps::quote(r)).collect();
-    let _ = writeln!(s, "$remote = @({})", remote.join(", "));
-    let desc = ps::quote("只允许经本机 AI 通道联网。由 AI Anchor 管理，用 anchor guard remove 移除。");
     for t in &plan.targets {
-        let _ = writeln!(
-            s,
-            "New-NetFirewallRule -DisplayName {} -Group $group -Direction Outbound -Action Block -Program {} \
-             -RemoteAddress $remote -Profile Any -Description {desc} | Out-Null",
-            ps::quote(&format!("AI Anchor Guard: {}", t.label)),
-            ps::quote(&t.path.to_string_lossy()),
-        );
+        let _ = writeln!(s, "{}", new_rule_ps(t, &fp, true));
     }
     s
 }
 
-fn require_admin() -> Result<()> {
-    let ok = Command::new("net")
-        .arg("session")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok {
-        bail!("需要管理员权限：请在“以管理员身份运行”的终端里执行这条命令");
+/// 现有规则与期望的差异。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Diff {
+    pub add: Vec<Target>,
+    pub remove: Vec<RuleInfo>,
+}
+
+impl Diff {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_empty() && self.remove.is_empty()
     }
-    Ok(())
+}
+
+/// 计算增量刷新：
+/// - 程序文件已不存在的规则删掉（应用更新后的旧版本路径）；
+/// - 阻断地址集合已变的规则删掉重建（指纹不符，含 P0 写的没有指纹的规则）；
+/// - prune 为 true 时，期望之外的规则也删掉（用户从 [apps] 去掉了某个程序）；
+/// - 期望的程序没有有效规则的，补上。
+///
+/// 不带 prune 的刷新只会删“文件已不存在”或“需要重建”的规则：即使某次扫描漏了程序，
+/// 也不会因此删掉仍然有效的规则。
+pub fn diff(desired: &[Target], rules: &[RuleInfo], fp: &str, prune: bool, exists: impl Fn(&Path) -> bool) -> Diff {
+    let tag = fp_tag(fp);
+    let mut d = Diff::default();
+    let mut kept: Vec<&RuleInfo> = Vec::new();
+    for r in rules {
+        let wanted = desired.iter().any(|t| same_path(&t.path, &r.program));
+        let duplicate = kept.iter().any(|k| same_path(&k.program, &r.program));
+        if !exists(&r.program) || !r.description.contains(&tag) || (prune && !wanted) || duplicate {
+            d.remove.push(r.clone());
+        } else {
+            kept.push(r);
+        }
+    }
+    for t in desired {
+        if !kept.iter().any(|k| same_path(&k.program, &t.path)) && !d.add.iter().any(|a| same_path(&a.path, &t.path)) {
+            d.add.push(t.clone());
+        }
+    }
+    d
+}
+
+/// 执行增量刷新的 PowerShell。enabled 为 false（守卫暂停中）时，新规则以停用状态写入。
+pub fn apply_script(d: &Diff, remote: &[String], enabled: bool) -> String {
+    let fp = fingerprint(remote);
+    let mut s = script_header(remote);
+    // 先加新规则再删旧规则：同一程序在替换过程中始终有规则，不会有一瞬间可以直连
+    for t in &d.add {
+        let _ = writeln!(s, "{}", new_rule_ps(t, &fp, enabled));
+    }
+    if !d.remove.is_empty() {
+        let ids: Vec<String> = d.remove.iter().map(|r| ps::quote(&r.id)).collect();
+        let _ = writeln!(s, "Remove-NetFirewallRule -Name @({})", ids.join(", "));
+    }
+    s
+}
+
+/// 启用或停用本组全部规则。返回脚本，输出 NONE 表示还没有规则。
+pub fn set_enabled_script(enabled: bool) -> String {
+    let verb = if enabled { "Enable-NetFirewallRule" } else { "Disable-NetFirewallRule" };
+    format!("{}\nif (-not $rules.Count) {{ 'NONE'; exit 0 }}\n$rules | {verb}", load_rules_ps())
+}
+
+pub fn require_admin() -> Result<()> {
+    win::require_admin()
 }
 
 pub fn install(cfg: &Config) -> Result<()> {
@@ -268,8 +367,7 @@ pub fn set_enabled(enabled: bool, yes: bool) -> Result<()> {
         return Ok(());
     }
     require_admin()?;
-    let verb = if enabled { "Enable-NetFirewallRule" } else { "Disable-NetFirewallRule" };
-    let out = ps::run_ok(&format!("{}\nif (-not $rules.Count) {{ 'NONE'; exit 0 }}\n$rules | {verb}", load_rules_ps()))?;
+    let out = ps::run_ok(&set_enabled_script(enabled))?;
     if out.trim() == "NONE" {
         bail!("还没有守卫规则：先运行 anchor guard install");
     }
@@ -277,11 +375,15 @@ pub fn set_enabled(enabled: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuleInfo {
+    /// 规则的唯一名称（Name，删除时用）
+    pub id: String,
     pub enabled: bool,
+    /// 显示名
     pub name: String,
     pub program: PathBuf,
+    pub description: String,
 }
 
 pub struct GuardStatus {
@@ -303,32 +405,41 @@ impl GuardStatus {
 pub fn read_rules() -> Result<Vec<RuleInfo>> {
     let script = format!(
         "{}\nforeach ($r in $rules) {{ \
-           $p = ($r | Get-NetFirewallApplicationFilter).Program; '{{0}}|{{1}}|{{2}}' -f $r.Enabled, $p, $r.DisplayName }}",
+           $p = ($r | Get-NetFirewallApplicationFilter).Program; \
+           '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $r.Enabled, $r.Name, $p, ($r.DisplayName -replace '\\|', '/'), ($r.Description -replace '[\\r\\n]', ' ') }}",
         load_rules_ps()
     );
-    let text = ps::run_ok(&script)?;
-    Ok(text
-        .lines()
+    Ok(parse_rules(&ps::run_ok(&script)?))
+}
+
+fn parse_rules(text: &str) -> Vec<RuleInfo> {
+    text.lines()
         .filter_map(|l| {
-            let mut it = l.trim().splitn(3, '|');
+            let mut it = l.trim().splitn(5, '|');
             let enabled = it.next()?.eq_ignore_ascii_case("true");
+            let id = it.next()?.to_string();
             let program = PathBuf::from(it.next()?);
             let name = it.next().unwrap_or_default().to_string();
-            Some(RuleInfo { enabled, name, program })
+            let description = it.next().unwrap_or_default().to_string();
+            Some(RuleInfo { id, enabled, name, program, description })
         })
-        .collect())
+        .collect()
 }
 
 pub fn status(cfg: &Config) -> Result<GuardStatus> {
     let rules = read_rules()?;
     let expected = plan(cfg)?.targets;
+    Ok(status_from(rules, expected))
+}
+
+pub fn status_from(rules: Vec<RuleInfo>, expected: Vec<Target>) -> GuardStatus {
     let missing = expected
         .iter()
         .filter(|t| !rules.iter().any(|r| r.enabled && same_path(&r.program, &t.path)))
         .cloned()
         .collect();
     let stale = rules.iter().filter(|r| !exists_any(&r.program)).cloned().collect();
-    Ok(GuardStatus { rules, expected, missing, stale })
+    GuardStatus { rules, expected, missing, stale }
 }
 
 pub fn print_status(st: &GuardStatus) {
@@ -340,13 +451,13 @@ pub fn print_status(st: &GuardStatus) {
     if st.missing.is_empty() {
         println!("配置里的 {} 个程序都已受守卫。", st.expected.len());
     } else {
-        println!("未受守卫的程序（运行 anchor guard install 补上）：");
+        println!("未受守卫的程序（运行 anchor guard install 补上；装了特权服务时会自动补上）：");
         for t in &st.missing {
             println!("  - {}：{}", t.label, t.path.display());
         }
     }
     if !st.stale.is_empty() {
-        println!("指向已不存在文件的旧规则（应用可能已更新）：{} 条，重新运行 anchor guard install 会清理。", st.stale.len());
+        println!("指向已不存在文件的旧规则（应用可能已更新）：{} 条，下次刷新会清理。", st.stale.len());
     }
 }
 
@@ -415,6 +526,78 @@ mod tests {
         assert!(blocked(&r, "198.20.0.0"));
         assert!(blocked(&r, "8.8.8.8"));
         assert!(blocked(&r, "192.168.1.1"));
+    }
+
+    fn rule(id: &str, program: &str, desc: &str) -> RuleInfo {
+        RuleInfo { id: id.into(), enabled: true, name: id.into(), program: program.into(), description: desc.into() }
+    }
+
+    fn target(path: &str) -> Target {
+        Target { label: path.into(), path: path.into() }
+    }
+
+    #[test]
+    fn diff_adds_new_versions_and_drops_vanished_files() {
+        let fp = "abcd1234";
+        let ok = rule_description(fp);
+        let rules = vec![rule("old", r"C:\WA\Claude_1\app\Claude.exe", &ok), rule("cur", r"C:\c\Cursor.exe", &ok)];
+        let desired = vec![target(r"C:\WA\Claude_2\app\Claude.exe"), target(r"c:\C\cursor.exe")];
+        let exists = |p: &Path| !p.to_string_lossy().contains("Claude_1");
+        let d = diff(&desired, &rules, fp, false, exists);
+        assert_eq!(d.add, vec![target(r"C:\WA\Claude_2\app\Claude.exe")]);
+        assert_eq!(d.remove.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["old"]);
+    }
+
+    #[test]
+    fn diff_rebuilds_rules_with_other_fingerprint_and_prunes_only_on_request() {
+        let rules = vec![
+            rule("p0", r"C:\a.exe", "P0 写的规则，没有指纹"),
+            rule("extra", r"C:\b.exe", &rule_description("f1")),
+            rule("dup", r"C:\b.exe", &rule_description("f1")),
+        ];
+        let desired = vec![target(r"C:\a.exe")];
+        let d = diff(&desired, &rules, "f1", false, |_| true);
+        assert_eq!(d.remove.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["p0", "dup"]);
+        assert_eq!(d.add, vec![target(r"C:\a.exe")]);
+        let pruned = diff(&desired, &rules, "f1", true, |_| true);
+        assert_eq!(pruned.remove.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(), ["p0", "extra", "dup"]);
+        assert!(diff(&[], &[], "f1", true, |_| true).is_empty());
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_sensitive() {
+        let a = blocked_remote(None).unwrap();
+        let b = blocked_remote(Some("198.18.0.0/15")).unwrap();
+        assert_eq!(fingerprint(&a), fingerprint(&a.clone()));
+        assert_ne!(fingerprint(&a), fingerprint(&b));
+        assert_eq!(fingerprint(&a).len(), 8);
+    }
+
+    #[test]
+    fn apply_script_removes_by_id_and_adds_disabled_when_paused() {
+        let d = Diff { add: vec![target(r"C:\it's.exe")], remove: vec![rule("{1}", r"C:\x.exe", "")] };
+        let s = apply_script(&d, &["0.0.0.0-126.255.255.255".to_string()], false);
+        assert!(s.contains("Remove-NetFirewallRule -Name @('{1}')"));
+        assert!(s.contains(r"-Program 'C:\it''s.exe'"));
+        assert!(s.contains("-Enabled False"));
+        assert!(s.find("New-NetFirewallRule").unwrap() < s.find("Remove-NetFirewallRule").unwrap(), "先加后删");
+    }
+
+    #[test]
+    fn parse_rules_reads_all_fields() {
+        let r = parse_rules("True|{abc}|C:\\x.exe|AI Anchor Guard: x|说明 [fp:1]\nFalse|{d}|C:\\y.exe|y|\n");
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].id, "{abc}");
+        assert!(r[0].enabled && !r[1].enabled);
+        assert_eq!(r[0].description, "说明 [fp:1]");
+    }
+
+    #[test]
+    fn extra_programs_refuse_system_and_relative_paths() {
+        assert!(refuse_extra(Path::new(r"C:\Windows\System32\curl.exe")).is_some());
+        assert!(refuse_extra(Path::new("tool.exe")).is_some());
+        assert!(refuse_extra(Path::new(r"D:\Tools\node.exe")).is_some());
+        assert!(refuse_extra(Path::new(r"D:\Tools\ai.exe")).is_none());
     }
 
     #[test]
