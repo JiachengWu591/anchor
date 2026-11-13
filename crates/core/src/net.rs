@@ -34,6 +34,8 @@ pub struct HttpResult {
     pub body: String,
     pub final_url: String,
     pub elapsed: Duration,
+    /// Cloudflare 的 cf-mitigated 响应头（"challenge" 表示要求人机验证）
+    pub cf_mitigated: Option<String>,
 }
 
 /// GET；4xx/5xx 也算拿到了响应（说明网络可达），只有传输层失败才返回错误。
@@ -46,8 +48,9 @@ pub fn get(agent: &ureq::Agent, url: &str) -> Result<HttpResult> {
     };
     let code = resp.status();
     let final_url = resp.get_url().to_string();
+    let cf_mitigated = resp.header("cf-mitigated").map(|v| v.trim().to_ascii_lowercase());
     let body = resp.into_string().unwrap_or_default();
-    Ok(HttpResult { code, body, final_url, elapsed: t.elapsed() })
+    Ok(HttpResult { code, body, final_url, elapsed: t.elapsed(), cf_mitigated })
 }
 
 #[derive(Debug, Clone, Serialize)]
