@@ -7,7 +7,19 @@ use serde_json::{Value, json};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+/// 当前数据目录的用户代理管道（main 里按 --home / ANCHOR_HOME 设定）。
+static PIPE: OnceLock<String> = OnceLock::new();
+
+pub fn init(paths: &Paths) {
+    let _ = PIPE.set(ipc::agent_pipe(&paths.home));
+}
+
+fn pipe() -> &'static str {
+    PIPE.get().map_or(AGENT_PIPE, String::as_str)
+}
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "AI Anchor";
@@ -25,11 +37,11 @@ pub fn sibling(name: &str) -> Result<PathBuf> {
 }
 
 pub fn running() -> bool {
-    ipc::is_running(AGENT_PIPE)
+    ipc::is_running(pipe())
 }
 
 pub fn call(method: &str, params: Value) -> Result<Value, CallError> {
-    ipc::call(AGENT_PIPE, method, params)
+    ipc::call(pipe(), method, params)
 }
 
 /// 登录自启和手动启动使用的命令行。
@@ -139,6 +151,9 @@ pub fn print_status(paths: &Paths) -> Result<()> {
             if let Some(e) = st["config_error"].as_str() {
                 println!("  配置      有误：{e}");
             }
+            if let Some(line) = exit_line(&st["exit"]) {
+                println!("  {line}");
+            }
             println!("  时间线    {}", v["timeline"].as_str().unwrap_or(""));
             println!("  托盘      {}", if v["tray"].as_bool().unwrap_or(false) { "显示" } else { "不显示（--no-tray）" });
         }
@@ -151,6 +166,57 @@ pub fn print_status(paths: &Paths) -> Result<()> {
     }
     let _ = paths;
     Ok(())
+}
+
+/// 出口锁定的一行说明（用户代理状态里的 exit）；还没开始核对时返回 None。
+pub fn exit_line(e: &Value) -> Option<String> {
+    let state = e["state"].as_str().filter(|s| !s.is_empty())?;
+    let baseline = e["baseline"].as_str().unwrap_or("");
+    let secs = e["locked_ms"].as_u64().map(|m| format!("，已锁住 {} 秒", m / 1000)).unwrap_or_default();
+    Some(match state {
+        "open" => format!("AI 通道  已放行：出口与基线 {baseline} 一致"),
+        "changed" => format!(
+            "AI 通道  已锁住：出口 IP 已变化（现在 {}，基线 {baseline}{secs}）。切回原出口会自动恢复；确认换成新 IP 运行 anchor baseline",
+            e["actual"].as_str().unwrap_or("未知")
+        ),
+        "unverifiable" => format!("AI 通道  已锁住：出口能连通，但 IP 回显服务都连不上，无法核对{secs}"),
+        "no_baseline" => "AI 通道  已锁住：还没有登记出口基线（anchor baseline）".to_string(),
+        _ if e["exit_down"].as_bool().unwrap_or(false) => format!("AI 通道  已锁住：出口不可达，恢复后核对一致再放行{secs}"),
+        _ => format!("AI 通道  正在核对出口{secs}"),
+    })
+}
+
+/// anchor exit check：请用户代理立即核对出口，等到有结果（最多 15 秒）。
+pub fn exit_check() -> Result<()> {
+    call("exit.recheck", Value::Null).map_err(|e| anyhow::anyhow!("anchor-agent {e}"))?;
+    println!("已请求立即核对出口：AI 通道先锁住，与基线一致后放行。");
+    let started = Instant::now();
+    let mut saw_verifying = false;
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let v = call("status", Value::Null).map_err(|e| anyhow::anyhow!("anchor-agent {e}"))?;
+        let e = &v["status"]["exit"];
+        let state = e["state"].as_str().unwrap_or("");
+        saw_verifying |= state == "verifying";
+        let settled = state != "verifying" && (saw_verifying || started.elapsed() > Duration::from_secs(3));
+        if settled || started.elapsed() > Duration::from_secs(15) {
+            if let Some(line) = exit_line(e) {
+                println!("{line}");
+            }
+            return Ok(());
+        }
+    }
+}
+
+/// 用户代理报告 AI 通道被出口锁定（不含正在核对这种几秒内就会结束的情况）时返回原因。
+pub fn exit_locked_reason() -> Option<String> {
+    let v = call("status", Value::Null).ok()?;
+    let e = &v["status"]["exit"];
+    match e["state"].as_str()? {
+        "changed" | "unverifiable" | "no_baseline" => exit_line(e).map(|l| l.trim_start_matches("AI 通道").trim().to_string()),
+        _ if e["exit_down"].as_bool().unwrap_or(false) => exit_line(e).map(|l| l.trim_start_matches("AI 通道").trim().to_string()),
+        _ => None,
+    }
 }
 
 pub fn kernel_state(s: &str) -> &'static str {
@@ -167,6 +233,16 @@ pub fn kernel_state(s: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exit_line_per_state() {
+        use serde_json::json;
+        assert_eq!(exit_line(&json!({})), None, "还没开始核对");
+        assert!(exit_line(&json!({ "state": "open", "baseline": "198.51.100.7" })).unwrap().contains("已放行"));
+        let changed = exit_line(&json!({ "state": "changed", "baseline": "1.1.1.1", "actual": "2.2.2.2", "locked_ms": 12500 })).unwrap();
+        assert!(changed.contains("现在 2.2.2.2") && changed.contains("已锁住 12 秒") && changed.contains("anchor baseline"), "{changed}");
+        assert!(exit_line(&json!({ "state": "verifying", "exit_down": true })).unwrap().contains("出口不可达"));
+    }
 
     #[test]
     fn command_line_quotes_paths_and_drops_trailing_backslash() {

@@ -1,6 +1,7 @@
 //! 用户代理的本机接口（\\.\pipe\ai-anchor-agent，只允许当前用户）。
 //!
-//! status：运行状态；reload：重新读取配置并重启内核；stop：退出；event：记录命令行发起的事件（目前只有 app_launch）。
+//! status：运行状态；reload：重新读取配置并重启内核；stop：退出；event：记录命令行发起的事件（目前只有 app_launch）；
+//! exit.recheck：先锁住 AI 通道，立即核对出口（与网络变化时的处理相同）。
 
 use crate::shared::Shared;
 use anchor_core::ipc::{Request, Response};
@@ -33,6 +34,11 @@ fn dispatch(sh: &Arc<Shared>, req: &Request) -> Result<Value> {
         "reload" => {
             sh.reload.store(true, Ordering::SeqCst);
             Ok(json!({ "reloading": true }))
+        }
+        "exit.recheck" => {
+            sh.recheck.store(true, Ordering::SeqCst);
+            sh.poke();
+            Ok(json!({ "rechecking": true }))
         }
         "stop" => {
             sh.request_stop("命令行请求");

@@ -89,6 +89,8 @@ pub struct SwitchCfg {
     pub tolerance_ms: u32,
     /// 线路看门狗的探测间隔；"0s" 或空表示关闭
     pub watch_interval: String,
+    /// 出口 IP 定时核对的间隔（网络变化、内核启动时另外立即核对）
+    pub exit_check_interval: String,
 }
 impl Default for SwitchCfg {
     fn default() -> Self {
@@ -99,10 +101,18 @@ impl Default for SwitchCfg {
             probe_interval: "30s".into(),
             tolerance_ms: 50,
             watch_interval: "3s".into(),
+            exit_check_interval: "60s".into(),
         }
     }
 }
 impl SwitchCfg {
+    /// 出口定时核对间隔，至少 5 秒。
+    pub fn exit_check_every(&self) -> std::time::Duration {
+        humantime::parse_duration(self.exit_check_interval.trim())
+            .unwrap_or(std::time::Duration::from_secs(60))
+            .max(std::time::Duration::from_secs(5))
+    }
+
     /// 看门狗间隔；None 表示关闭。
     pub fn watch_every(&self) -> Option<std::time::Duration> {
         let s = self.watch_interval.trim();
@@ -143,9 +153,11 @@ impl Default for GuardCfg {
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CoreCfg { pub path: String, pub log_level: String, pub api_port: u16, pub api_secret: String }
+pub struct CoreCfg { pub path: String, pub log_level: String, pub api_port: u16, pub api_secret: String, pub probe_port: u16 }
 impl Default for CoreCfg {
-    fn default() -> Self { Self { path: String::new(), log_level: "info".into(), api_port: 0, api_secret: String::new() } }
+    fn default() -> Self {
+        Self { path: String::new(), log_level: "info".into(), api_port: 0, api_secret: String::new(), probe_port: 0 }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,7 +200,7 @@ pub struct Config {
 }
 
 /// sing-box 配置里由 AI Anchor 占用的出站名。
-const RESERVED: &[&str] = &["exit", "lines", "direct", "ai-in"];
+const RESERVED: &[&str] = &["exit", "lines", "direct", "ai-in", "probe-in"];
 
 impl Config {
     pub fn load(paths: &Paths) -> Result<Self> {
@@ -199,7 +211,8 @@ impl Config {
     }
 
     pub fn parse(text: &str) -> Result<Self> {
-        let cfg: Config = toml::from_str(text)?;
+        // 记事本“UTF-8 带 BOM”、PowerShell 5 的 Set-Content -Encoding utf8 都会在开头写 BOM
+        let cfg: Config = toml::from_str(text.trim_start_matches('\u{feff}'))?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -226,6 +239,16 @@ impl Config {
         if self.proxy.port == 0 {
             bail!("[proxy] port 不能为 0");
         }
+        let (ai, api, probe) = (self.proxy.port, self.api_port(), self.probe_port());
+        if ai == api || ai == probe || api == probe {
+            bail!("AI 代理端口 {ai}、Clash API 端口 {api}、探测端口 {probe} 不能相同（[proxy] port、[core] api_port、[core] probe_port）");
+        }
+        // sing-box 的测速接口（Clash API delay）遇到 http:// 地址会忽略它，改测默认地址，结果就不可信了
+        if !self.switch.probe_url.trim().starts_with("https://") {
+            bail!("[switch] probe_url 必须是 https:// 地址（sing-box 测速会忽略 http:// 地址）：{}", self.switch.probe_url);
+        }
+        let e = self.switch.exit_check_interval.trim();
+        humantime::parse_duration(e).with_context(|| format!("[switch] exit_check_interval 格式错误：{e}（例如 \"60s\"）"))?;
         let w = self.switch.watch_interval.trim();
         if !w.is_empty() {
             let d = humantime::parse_duration(w).with_context(|| format!("[switch] watch_interval 格式错误：{w}（例如 \"3s\"，\"0s\" 表示关闭）"))?;
@@ -242,6 +265,28 @@ impl Config {
 
     pub fn api_port(&self) -> u16 {
         if self.core.api_port != 0 { self.core.api_port } else { self.proxy.port.wrapping_add(1) }
+    }
+
+    /// 探测专用入站的端口：用户代理和命令行核对出口走它，AI 通道锁住时也能用。
+    pub fn probe_port(&self) -> u16 {
+        if self.core.probe_port != 0 { self.core.probe_port } else { self.proxy.port.wrapping_add(2) }
+    }
+
+    /// 探测入站的账号密码。密码由 api_secret 派生，只含十六进制字符，可直接放进代理地址。
+    pub fn probe_auth(&self) -> (String, String) {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in "ai-anchor-probe:".bytes().chain(self.core.api_secret.bytes()) {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        ("anchor".into(), format!("{h:016x}"))
+    }
+
+    /// 经探测入站联网的代理地址（带认证）。用 SOCKS5：ureq 经 HTTP 代理访问 http:// 地址时
+    /// 不发 Proxy-Authorization（只有 CONNECT 才带），SOCKS5 对两种地址都会先认证。
+    pub fn probe_proxy_url(&self) -> String {
+        let (user, pass) = self.probe_auth();
+        format!("socks5://{user}:{pass}@{}", host_port("127.0.0.1", self.probe_port()))
     }
 
     /// AI 程序使用的代理地址（HTTP CONNECT，同端口也接受 SOCKS5）。
@@ -274,7 +319,7 @@ pub fn host_port(host: &str, port: u16) -> String {
 pub fn set_expect(paths: &Paths, info: &ExitInfo) -> Result<()> {
     let p = paths.config();
     let text = std::fs::read_to_string(&p)?;
-    let mut doc: toml_edit::DocumentMut = text.parse().context("解析 anchor.toml 失败")?;
+    let mut doc: toml_edit::DocumentMut = text.trim_start_matches('\u{feff}').parse().context("解析 anchor.toml 失败")?;
     doc["expect"]["ip"] = toml_edit::value(info.ip.clone());
     if let Some(tz) = &info.timezone {
         doc["expect"]["timezone"] = toml_edit::value(tz.clone());
@@ -352,6 +397,8 @@ probe_interval = "30s"
 tolerance_ms = 50
 # 线路看门狗：每隔这么久探测当前线路，失败时立即重新选线，不必等 probe_interval。"0s" 关闭
 watch_interval = "3s"
+# 出口 IP 定时核对（至少 5 秒）。网络变化、内核启动时会先锁住 AI 通道并立即核对，与基线一致才放行
+exit_check_interval = "60s"
 
 [apps]
 # 纳入 AI Anchor 的程序，名称见 `anchor scan`。
@@ -379,6 +426,7 @@ path = ""
 log_level = "info"
 api_port = 0                 # 0 表示代理端口 + 1
 api_secret = "__SECRET__"
+probe_port = 0               # 探测专用入站（带认证，核对出口用）；0 表示代理端口 + 2
 "#;
 
 #[cfg(test)]
@@ -454,6 +502,24 @@ mod tests {
         assert_eq!(off.switch.watch_every(), None);
         assert!(Config::parse(&format!("{MIN}[switch]\nwatch_interval = \"500ms\"\n")).is_err());
         assert!(Config::parse(&format!("{MIN}[switch]\nwatch_interval = \"fast\"\n")).is_err());
+    }
+
+    #[test]
+    fn accepts_utf8_bom() {
+        assert!(Config::parse(&format!("\u{feff}{MIN}")).is_ok());
+    }
+
+    #[test]
+    fn probe_port_and_auth() {
+        let cfg = Config::parse(&format!("{MIN}[core]\napi_secret = \"x\"\n")).unwrap();
+        assert_eq!(cfg.probe_port(), 17892);
+        let url = cfg.probe_proxy_url();
+        assert!(url.starts_with("socks5://anchor:") && url.ends_with("@127.0.0.1:17892"), "{url}");
+        let other = Config::parse(&format!("{MIN}[core]\napi_secret = \"y\"\n")).unwrap();
+        assert_ne!(cfg.probe_auth().1, other.probe_auth().1, "密码随 api_secret 变化");
+        assert!(Config::parse(&format!("{MIN}[core]\nprobe_port = 17890\n")).is_err(), "与 AI 端口冲突");
+        assert!(Config::parse(&format!("{MIN}[switch]\nexit_check_interval = \"soon\"\n")).is_err());
+        assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"http://x/204\"\n")).is_err(), "测速地址必须是 https");
     }
 
     #[test]

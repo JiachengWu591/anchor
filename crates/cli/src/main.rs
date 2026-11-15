@@ -95,6 +95,11 @@ enum Cmd {
     },
     /// 扫描本机已安装的 AI 程序
     Scan,
+    /// 出口：核对与锁定
+    Exit {
+        #[command(subcommand)]
+        action: ExitCmd,
+    },
     /// 防火墙守卫：保证 AI 程序只能经 AI 通道联网
     Guard {
         #[command(subcommand)]
@@ -153,6 +158,12 @@ enum AgentCmd {
     Install,
     /// 取消登录后自动启动，并退出
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ExitCmd {
+    /// 立即核对出口：先锁住 AI 通道，与基线一致后放行（和网络变化时一样）
+    Check,
 }
 
 #[derive(Subcommand)]
@@ -224,6 +235,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
 
 fn real_main(cli: Cli) -> Result<i32> {
     let paths = Paths::resolve(cli.home)?;
+    agentctl::init(&paths);
     let pkg = if unsafe_in_package(&cli.cmd) || matches!(cli.cmd, Cmd::Check { .. }) { win::sandbox() } else { None };
     if !matches!(cli.cmd, Cmd::Rules { .. } | Cmd::Repair) {
         sandbox::warn_private_copies(&paths);
@@ -274,6 +286,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Baseline { yes } => baseline(&paths, yes)?,
         Cmd::Scan => scan(&paths),
         Cmd::Guard { action } => guard_cmd(&paths, action)?,
+        Cmd::Exit { action: ExitCmd::Check } => agentctl::exit_check()?,
         Cmd::Run { program, args } => return launch::run_cli(&Config::load(&paths)?, &program, &args),
         Cmd::Launch { app, pause_on_error } => {
             pause_if_err(pause_on_error, || launch::launch_desktop(&Config::load(&paths)?, &app))?
@@ -346,11 +359,12 @@ fn init(paths: &Paths, force: bool) -> Result<()> {
 
 fn gen_config(paths: &Paths, stdout: bool) -> Result<()> {
     let cfg = Config::load(paths)?;
+    // 与用户代理运行的配置一致（带出口锁定）
     if stdout {
-        println!("{}", serde_json::to_string_pretty(&singbox::generate(&cfg, paths)?)?);
+        println!("{}", serde_json::to_string_pretty(&singbox::generate(&cfg, paths, true)?)?);
         return Ok(());
     }
-    let p = kernel::write_config(&cfg, paths)?;
+    let p = kernel::write_config(&cfg, paths, true)?;
     println!("已生成 sing-box 配置：{}", p.display());
     match kernel::find_singbox(&cfg, paths) {
         Ok(sb) => {
@@ -371,7 +385,9 @@ fn up(paths: &Paths) -> Result<()> {
         bail!("anchor-agent 正在运行，它已经在守护内核。要前台调试，先运行 anchor agent stop");
     }
     let cfg = Config::load(paths)?;
-    let (sb, json) = kernel::prepare(&cfg, paths)?;
+    // 前台调试没有人核对出口，不启用出口锁定
+    let (sb, json) = kernel::prepare(&cfg, paths, false)?;
+    println!("注意：anchor up 不核对出口，也不会在出口 IP 变化时锁住 AI 通道；日常请用 anchor agent start。");
     let stop = Arc::new(AtomicBool::new(false));
     {
         let s = stop.clone();
@@ -425,7 +441,8 @@ fn baseline(paths: &Paths, yes: bool) -> Result<()> {
     if !net::port_open(&cfg.proxy.listen, cfg.proxy.port) {
         bail!("内核未运行：先启动 AI Anchor（anchor agent start）");
     }
-    let agent = net::agent_via_proxy(&cfg, Duration::from_secs(10))?;
+    // 经探测入站：AI 通道因出口变化被锁住时，也能测到现在的出口
+    let agent = net::agent_for_checks(&cfg, Duration::from_secs(10))?;
     let info = net::fetch_exit(&agent, &cfg.check)?;
     println!("经通道测得的出口：");
     println!("  IP    {}", info.ip);
@@ -442,6 +459,10 @@ fn baseline(paths: &Paths, yes: bool) -> Result<()> {
     }
     config::set_expect(paths, &info)?;
     println!("已写入 {}", paths.config().display());
+    if agentctl::running() {
+        // 用户代理按新基线重新核对；出口因 IP 变化被锁住时，这一步就是确认新 IP
+        agentctl::reload()?;
+    }
     Ok(())
 }
 
@@ -500,6 +521,9 @@ fn status(paths: &Paths) -> Result<()> {
             // 配置错误上面已经单独显示过
             if let Some(e) = st["kernel_error"].as_str().or(st["config_error"].as_str().filter(|_| cfg.is_ok())) {
                 println!("      {e}");
+            }
+            if let Some(line) = agentctl::exit_line(&st["exit"]) {
+                println!("{line}");
             }
         }
         None => {

@@ -283,6 +283,29 @@ pub fn describe(e: &Event) -> (&'static str, String) {
         "guard_pause" => ("守卫暂停", format!("守卫已暂停，到 {} 自动恢复", s(d, "until"))),
         "guard_resume" => ("守卫恢复", "守卫已恢复".into()),
         "app_launch" => ("启动应用", format!("{}（{}）", s(d, "app"), s(d, "exe"))),
+        "exit_locked" => {
+            let why = match s(d, "reason") {
+                "network_change" => "网络变化",
+                "kernel_start" => "内核启动",
+                "exit_down" => "出口不可达",
+                "recheck" => "手动核对",
+                "no_baseline" => "还没有登记出口基线",
+                other => other,
+            };
+            ("出口锁定", format!("AI 通道已锁住，核对出口后再放行（{why}）"))
+        }
+        "exit_unlocked" => {
+            let locked = n("locked_ms").map(|m| format!("，锁住 {}", secs(m))).unwrap_or_default();
+            match s(d, "reason") {
+                "back_to_baseline" => ("出口恢复", format!("出口回到基线 {}，AI 通道已放行{locked}", s(d, "ip"))),
+                _ => ("出口放行", format!("出口 {} 与基线一致，AI 通道已放行{locked}", s(d, "ip"))),
+            }
+        }
+        "exit_ip_changed" => (
+            "出口变化",
+            format!("出口 IP 已变化：基线 {}，现在 {}；AI 通道已锁住", s(d, "baseline"), s(d, "actual")),
+        ),
+        "exit_unverifiable" => ("无法核对", "出口能连通，但 IP 回显服务都连不上；AI 通道保持锁住".into()),
         "config_error" => ("配置错误", s(d, "message").to_string()),
         _ => ("其他", format!("{} {}", e.kind, e.detail)),
     }
@@ -307,6 +330,24 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(describe(&only[0]).1, "a → b（当前线路探测失败，800 ms）；出口 IP 不变");
         assert_eq!(describe(&all[1]).1, "sing-box 意外退出（退出码 1，运行了 5.0 秒），2.4 秒后恢复");
+    }
+
+    #[test]
+    fn describes_exit_lock_events() {
+        let ev = |kind: &str, detail: Value| Event { ts: 0, kind: kind.into(), detail };
+        assert_eq!(
+            describe(&ev("exit_locked", json!({ "reason": "network_change" }))),
+            ("出口锁定", "AI 通道已锁住，核对出口后再放行（网络变化）".to_string())
+        );
+        assert_eq!(
+            describe(&ev("exit_unlocked", json!({ "reason": "verified", "ip": "1.1.1.1", "locked_ms": 900 }))).1,
+            "出口 1.1.1.1 与基线一致，AI 通道已放行，锁住 900 毫秒"
+        );
+        assert_eq!(describe(&ev("exit_unlocked", json!({ "reason": "back_to_baseline", "ip": "1.1.1.1" }))).0, "出口恢复");
+        assert_eq!(
+            describe(&ev("exit_ip_changed", json!({ "baseline": "1.1.1.1", "actual": "2.2.2.2" }))).1,
+            "出口 IP 已变化：基线 1.1.1.1，现在 2.2.2.2；AI 通道已锁住"
+        );
     }
 
     #[test]

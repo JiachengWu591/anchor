@@ -4,12 +4,14 @@
 
 pub mod apps;
 pub mod config;
+pub mod exitlock;
 pub mod guard;
 pub mod ipc;
 pub mod kernel;
 pub mod log;
 pub mod net;
 pub mod netenv;
+pub mod netwatch;
 pub mod ps;
 pub mod rules;
 pub mod singbox;

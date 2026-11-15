@@ -7,7 +7,7 @@ use anchor_core::log;
 use anchor_core::watch::{self, WatchEvent};
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -62,7 +62,8 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
         st.kernel = KernelState::Starting;
         st.kernel_error = None;
     }
-    let (sb, json_path) = match kernel::prepare(cfg, &sh.paths) {
+    // AI 通道以锁住状态启动，出口核对通过后才放行
+    let (sb, json_path) = match kernel::prepare(cfg, &sh.paths, true) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("{e:#}");
@@ -100,10 +101,18 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
     if let Some((every, _)) = &watcher {
         log::line(&format!("线路看门狗：每 {} 探测当前线路", humantime::format_duration(*every)));
     }
+    // 内核每次（重新）开始监听加一：它以锁住状态启动，出口核对要重新来过
+    let kernel_gen = Arc::new(AtomicU64::new(0));
+    let exit_guard = crate::exitguard::spawn(sh.clone(), cfg, sess_stop.clone(), kernel_gen.clone());
 
     let mut failing = 0u32;
     let r = kernel::supervise(cfg, &sh.paths, &sb, &json_path, &sess_stop, &kernel::Options { background: true }, &mut |ev| {
-        on_kernel(sh, ev, &mut failing)
+        let started = matches!(ev, KernelEvent::Started { .. } | KernelEvent::Recovered { .. });
+        on_kernel(sh, ev, &mut failing);
+        if started {
+            kernel_gen.fetch_add(1, Ordering::SeqCst);
+            sh.poke();
+        }
     });
     if let Err(e) = r {
         let msg = format!("{e:#}");
@@ -114,7 +123,9 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
         wait_reload(sh, Some(Duration::from_secs(60)));
     }
     sess_stop.store(true, Ordering::SeqCst);
+    sh.poke();
     let _ = bridge.join();
+    let _ = exit_guard.join();
     if let Some((_, h)) = watcher {
         let _ = h.join();
     }

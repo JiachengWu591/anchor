@@ -155,7 +155,8 @@ pub fn run(cfg: &Config) -> Report {
             let path = if cfg.lines.is_empty() { "出口 → 目标" } else { "线路 → 出口 → 目标" };
             p.push(Probe { latency_ms: Some(ms), ..probe(EXIT, "整条链路", St::Pass, None, path) });
         }
-        match net::agent_via_proxy(cfg, Duration::from_secs(10)).and_then(|a| net::fetch_exit(&a, &cfg.check)) {
+        // 经探测入站：AI 通道被出口锁定时也能看到现在的出口
+        match net::agent_for_checks(cfg, Duration::from_secs(10)).and_then(|a| net::fetch_exit(&a, &cfg.check)) {
             Ok(info) => {
                 let (st, detail) = if cfg.expect.ip.trim().is_empty() {
                     (St::Warn, format!("实际 {}；还没有登记基线（anchor baseline）", info.ip))
@@ -170,12 +171,15 @@ pub fn run(cfg: &Config) -> Report {
             }
             Err(e) => p.push(probe(EXIT, "出口 IP", St::Fail, None, format!("经通道访问失败：{e:#}"))),
         }
+        if let Some(x) = lock_probe() {
+            p.push(x);
+        }
     } else {
         p.push(probe(EXIT, "出口 IP", St::Skip, None, "内核未运行"));
     }
 
     // 5. AI 服务：官方状态页 + 关键域名可达性
-    match (core_up, net::agent_via_proxy(cfg, Duration::from_secs(10))) {
+    match (core_up, net::agent_for_checks(cfg, Duration::from_secs(10))) {
         (true, Ok(agent)) => {
             for (vendor, url) in STATUS_PAGES {
                 p.push(status_page(&agent, vendor, url));
@@ -199,6 +203,23 @@ pub fn run(cfg: &Config) -> Report {
 
     let verdict = attribute(&p, !cfg.lines.is_empty(), tunnel.as_ref().map(|t| t.name.as_str()));
     Report { time: now_rfc3339(), healthy: !p.iter().any(|x| x.status == St::Fail), verdict, exit: exit_info, probes: p }
+}
+
+/// 用户代理的出口锁定状态（没有用户代理时没有这一项）。
+fn lock_probe() -> Option<Probe> {
+    let v = crate::agentctl::call("status", Value::Null).ok()?;
+    lock_probe_from(&v["status"]["exit"])
+}
+
+fn lock_probe_from(e: &Value) -> Option<Probe> {
+    let line = crate::agentctl::exit_line(e)?;
+    let st = match e["state"].as_str().unwrap_or("") {
+        "open" => St::Pass,
+        "verifying" if !e["exit_down"].as_bool().unwrap_or(false) => St::Warn,
+        "no_baseline" => St::Warn,
+        _ => St::Fail,
+    };
+    Some(probe(EXIT, "AI 通道", st, None, line.trim_start_matches("AI 通道").trim()))
 }
 
 /// 官方状态页是服务商的公告，不是 AI Anchor 测到的故障：最多标 WARN，由结论单独说明；
@@ -456,6 +477,19 @@ mod tests {
 
     fn target(path: &str) -> crate::guard::Target {
         crate::guard::Target { label: "Claude 桌面版".into(), path: path.into() }
+    }
+
+    #[test]
+    fn exit_lock_shows_up_and_is_attributed_to_the_exit() {
+        use serde_json::json;
+        assert_eq!(lock_probe_from(&json!({ "state": "open", "baseline": "1.1.1.1" })).unwrap().status, St::Pass);
+        assert_eq!(lock_probe_from(&json!({ "state": "verifying" })).unwrap().status, St::Warn);
+        let changed = lock_probe_from(&json!({ "state": "changed", "baseline": "1.1.1.1", "actual": "2.2.2.2" })).unwrap();
+        assert_eq!(changed.status, St::Fail);
+        assert_eq!(changed.segment, EXIT);
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), changed];
+        assert!(attribute(&p, false, None).contains("出口"));
+        assert!(lock_probe_from(&json!({})).is_none(), "用户代理还没开始核对");
     }
 
     #[test]

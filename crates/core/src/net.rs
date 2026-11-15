@@ -18,15 +18,50 @@ pub fn agent_direct(timeout: Duration) -> ureq::Agent {
         .build()
 }
 
-/// 经本机 AI 通道。
+/// 经本机 AI 通道（AI 程序用的端口；出口锁住时连不上）。
 pub fn agent_via_proxy(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
-    let proxy = ureq::Proxy::new(cfg.proxy_url()).context("代理地址格式错误")?;
+    proxied(&cfg.proxy_url(), timeout)
+}
+
+/// 经探测专用入站：与 AI 通道走同一个出口，但不受出口锁定影响。核对出口、体检用它。
+pub fn agent_via_probe(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
+    proxied(&cfg.probe_proxy_url(), timeout)
+}
+
+/// 命令行核对出口用：探测入站在监听就用它，否则（内核是旧版本启动的）退回 AI 端口。
+pub fn agent_for_checks(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
+    if port_open("127.0.0.1", cfg.probe_port()) { agent_via_probe(cfg, timeout) } else { agent_via_proxy(cfg, timeout) }
+}
+
+fn proxied(url: &str, timeout: Duration) -> Result<ureq::Agent> {
+    let proxy = ureq::Proxy::new(url).context("代理地址格式错误")?;
     Ok(ureq::AgentBuilder::new()
         .proxy(proxy)
-        .timeout_connect(Duration::from_secs(5))
+        .timeout_connect(Duration::from_secs(5).min(timeout))
         .timeout(timeout)
         .user_agent(UA)
         .build())
+}
+
+/// 从一个回显服务取出口 IP：纯文本 IP，或带 "ip" 字段的 JSON（如 ipinfo）。
+pub fn echo_ip(agent: &ureq::Agent, url: &str) -> Result<String> {
+    parse_echo(&get(agent, url)?)
+}
+
+/// 解析回显服务的响应。能走到这一步说明经出口拿到了响应，出错只是回显服务本身的问题。
+pub fn parse_echo(r: &HttpResult) -> Result<String> {
+    if r.code != 200 {
+        bail!("HTTP {}", r.code);
+    }
+    let body = r.body.trim();
+    let ip = match serde_json::from_str::<Value>(body) {
+        Ok(v) => v.get("ip").and_then(Value::as_str).unwrap_or_default().to_string(),
+        Err(_) => body.to_string(),
+    };
+    match ip.parse::<IpAddr>() {
+        Ok(a) => Ok(a.to_string()),
+        Err(_) => bail!("返回内容不是 IP 地址"),
+    }
 }
 
 pub struct HttpResult {
@@ -191,6 +226,29 @@ impl ClashApi {
     /// 线路组当前选中的线路。
     pub fn current_line(&self) -> Option<String> {
         self.get("/proxies/lines").ok()?.get("now")?.as_str().map(str::to_string)
+    }
+
+    /// 当前 Clash 模式（出口锁定用 Lock / Open）。
+    pub fn mode(&self) -> Option<String> {
+        self.get("/configs").ok()?.get("mode")?.as_str().map(str::to_string)
+    }
+
+    /// 切换 Clash 模式，并读回确认已生效（不认识的模式会被内核忽略）。
+    pub fn set_mode(&self, mode: &str) -> Result<()> {
+        let url = format!("{}/configs", self.base);
+        let mut req = self.agent.request("PATCH", &url).set("Content-Type", "application/json");
+        if !self.secret.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.secret));
+        }
+        match req.send_string(&serde_json::json!({ "mode": mode }).to_string()) {
+            Ok(_) => {}
+            Err(ureq::Error::Status(code, r)) => bail!("Clash API 返回 {code}：{}", r.into_string().unwrap_or_default().trim()),
+            Err(e) => return Err(e.into()),
+        }
+        match self.mode() {
+            Some(m) if m.eq_ignore_ascii_case(mode) => Ok(()),
+            other => bail!("切换到 {mode} 后读回的模式是 {}", other.as_deref().unwrap_or("未知")),
+        }
     }
 }
 

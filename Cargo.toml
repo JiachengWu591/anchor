@@ -21,7 +21,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 toml = "0.8"
 toml_edit = "0.22"
-ureq = "2"
+# socks-proxy：探测入站走带认证的 SOCKS5（HTTP 代理对 http:// 目标不带认证头）
+ureq = { version = "2", features = ["socks-proxy"] }
 windows-service = "0.8"
 windows-sys = "0.59"
 winreg = "0.55"
