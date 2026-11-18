@@ -1,13 +1,12 @@
-//! 一次“会话”= 按当前配置运行内核和线路看门狗。收到重新加载请求或退出时结束，再按新配置开始下一次。
+//! 一次“会话”= 按当前配置运行内核、线路控制器、出口核对和持续探测。收到重新加载请求或退出时结束，再按新配置开始下一次。
 
 use crate::shared::{KernelState, Level, Shared};
 use anchor_core::config::{Config, LineMode, host_port};
 use anchor_core::kernel::{self, KernelEvent};
 use anchor_core::log;
-use anchor_core::watch::{self, WatchEvent};
 use serde_json::json;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -15,14 +14,26 @@ use std::time::{Duration, Instant};
 const NOTIFY_AFTER_RESTARTS: u32 = 3;
 
 pub fn run(sh: Arc<Shared>) {
+    // 上一次会话用的出口：换了就记一条 exit_switch
+    let mut last_exit: Option<String> = None;
     while !sh.stopping() {
         sh.reload.store(false, Ordering::SeqCst);
         match Config::load(&sh.paths) {
             Ok(cfg) => {
                 sh.status().config_error = None;
+                let cfg = Arc::new(cfg);
+                let name = cfg.exit_name();
+                if let Some(prev) = last_exit.replace(name.clone())
+                    && prev != name
+                {
+                    log::line(&format!("出口 {prev} → {name}（anchor exit use）"));
+                    sh.tl.event("exit_switch", json!({ "from": prev, "to": name, "label": cfg.exit.label() }));
+                }
+                *sh.cfg.lock().unwrap_or_else(|e| e.into_inner()) = Some(cfg.clone());
                 one(&sh, &cfg);
             }
             Err(e) => {
+                *sh.cfg.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 let msg = format!("{e:#}");
                 let changed = sh.status().config_error.as_deref() != Some(msg.as_str());
                 if changed {
@@ -52,6 +63,7 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
     {
         let mut st = sh.status();
         st.listen = host_port(&cfg.proxy.listen, cfg.proxy.port);
+        st.exit_name = cfg.exit_name();
         st.lines = cfg.lines.len();
         st.line_mode = match cfg.switch.lines {
             LineMode::Auto => "auto".into(),
@@ -62,7 +74,8 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
         st.kernel = KernelState::Starting;
         st.kernel_error = None;
     }
-    let (sb, json_path) = match kernel::prepare(cfg, &sh.paths) {
+    // AI 通道以锁住状态启动，出口核对通过后才放行
+    let (sb, json_path) = match kernel::prepare(cfg, &sh.paths, true) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!("{e:#}");
@@ -93,17 +106,21 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
             }
         })
     };
-    let watcher = {
-        let sh = sh.clone();
-        watch::spawn(cfg, sess_stop.clone(), move |ev| on_watch(&sh, ev))
-    };
-    if let Some((every, _)) = &watcher {
-        log::line(&format!("线路看门狗：每 {} 探测当前线路", humantime::format_duration(*every)));
-    }
+    // 内核每次（重新）开始监听加一：它以锁住状态启动，出口核对要重新来过，线路组也要重新选
+    let kernel_gen = Arc::new(AtomicU64::new(0));
+    let line_ctl = crate::lines::spawn(sh.clone(), cfg, sess_stop.clone(), kernel_gen.clone());
+    let exit_guard = crate::exitguard::spawn(sh.clone(), cfg, sess_stop.clone(), kernel_gen.clone());
+    // 本地网络、整条链路的持续探测，断联归因用
+    let health = crate::health::spawn(sh.clone(), cfg, sess_stop.clone());
 
     let mut failing = 0u32;
     let r = kernel::supervise(cfg, &sh.paths, &sb, &json_path, &sess_stop, &kernel::Options { background: true }, &mut |ev| {
-        on_kernel(sh, ev, &mut failing)
+        let started = matches!(ev, KernelEvent::Started { .. } | KernelEvent::Recovered { .. });
+        on_kernel(sh, ev, &mut failing);
+        if started {
+            kernel_gen.fetch_add(1, Ordering::SeqCst);
+            sh.poke();
+        }
     });
     if let Err(e) = r {
         let msg = format!("{e:#}");
@@ -114,8 +131,11 @@ fn one(sh: &Arc<Shared>, cfg: &Config) {
         wait_reload(sh, Some(Duration::from_secs(60)));
     }
     sess_stop.store(true, Ordering::SeqCst);
+    sh.poke();
     let _ = bridge.join();
-    if let Some((_, h)) = watcher {
+    let _ = exit_guard.join();
+    let _ = health.join();
+    if let Some(h) = line_ctl {
         let _ = h.join();
     }
 }
@@ -168,46 +188,6 @@ fn on_kernel(sh: &Shared, ev: KernelEvent, failing: &mut u32) {
         KernelEvent::Stopped => {
             sh.status().kernel = KernelState::Stopped;
             log::line("内核已停止");
-        }
-    }
-}
-
-fn on_watch(sh: &Shared, ev: WatchEvent) {
-    match ev {
-        WatchEvent::Probe { line, ok, ms, note } => {
-            sh.tl.probe("line", &line, ok, ms, &note);
-            // 当前线路的定时探测（组测速的结果不代表当前线路）
-            if ok && note.is_empty() {
-                sh.status().line = Some(line);
-            }
-        }
-        WatchEvent::Switched { from, to, ms } => {
-            {
-                let mut st = sh.status();
-                st.line = Some(to.clone());
-                st.lines_down = false;
-            }
-            log::line(&format!("线路 {from} 探测失败，已切换到 {to}"));
-            sh.tl.event("line_switch", json!({ "from": from, "to": to, "reason": "down", "ms": ms }));
-        }
-        WatchEvent::LineDown { line } => {
-            sh.status().lines_down = true;
-            sh.tl.event("line_down", json!({ "line": line }));
-            sh.notify(Level::Warn, "当前线路不可用", &format!("线路 {line} 探测失败。手动模式不会自动切换；AI 新连接会失败，不会直连。"));
-        }
-        WatchEvent::AllDown { line } => {
-            sh.status().lines_down = true;
-            sh.tl.event("all_lines_down", json!({ "line": line }));
-            sh.notify(Level::Error, "所有线路都不可用", "AI 新连接会失败，不会直连；出口 IP 不会因此改变。线路恢复后会再通知。");
-        }
-        WatchEvent::Recovered { line } => {
-            {
-                let mut st = sh.status();
-                st.lines_down = false;
-                st.line = Some(line.clone());
-            }
-            sh.tl.event("line_recovered", json!({ "line": line }));
-            sh.notify(Level::Info, "线路已恢复", &format!("当前线路 {line}，AI 通道可用。"));
         }
     }
 }

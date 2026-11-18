@@ -18,15 +18,50 @@ pub fn agent_direct(timeout: Duration) -> ureq::Agent {
         .build()
 }
 
-/// 经本机 AI 通道。
+/// 经本机 AI 通道（AI 程序用的端口；出口锁住时连不上）。
 pub fn agent_via_proxy(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
-    let proxy = ureq::Proxy::new(cfg.proxy_url()).context("代理地址格式错误")?;
+    proxied(&cfg.proxy_url(), timeout)
+}
+
+/// 经探测专用入站：与 AI 通道走同一个出口，但不受出口锁定影响。核对出口、体检用它。
+pub fn agent_via_probe(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
+    proxied(&cfg.probe_proxy_url(), timeout)
+}
+
+/// 命令行核对出口用：探测入站在监听就用它，否则（内核是旧版本启动的）退回 AI 端口。
+pub fn agent_for_checks(cfg: &Config, timeout: Duration) -> Result<ureq::Agent> {
+    if port_open("127.0.0.1", cfg.probe_port()) { agent_via_probe(cfg, timeout) } else { agent_via_proxy(cfg, timeout) }
+}
+
+fn proxied(url: &str, timeout: Duration) -> Result<ureq::Agent> {
+    let proxy = ureq::Proxy::new(url).context("代理地址格式错误")?;
     Ok(ureq::AgentBuilder::new()
         .proxy(proxy)
-        .timeout_connect(Duration::from_secs(5))
+        .timeout_connect(Duration::from_secs(5).min(timeout))
         .timeout(timeout)
         .user_agent(UA)
         .build())
+}
+
+/// 从一个回显服务取出口 IP：纯文本 IP，或带 "ip" 字段的 JSON（如 ipinfo）。
+pub fn echo_ip(agent: &ureq::Agent, url: &str) -> Result<String> {
+    parse_echo(&get(agent, url)?)
+}
+
+/// 解析回显服务的响应。能走到这一步说明经出口拿到了响应，出错只是回显服务本身的问题。
+pub fn parse_echo(r: &HttpResult) -> Result<String> {
+    if r.code != 200 {
+        bail!("HTTP {}", r.code);
+    }
+    let body = r.body.trim();
+    let ip = match serde_json::from_str::<Value>(body) {
+        Ok(v) => v.get("ip").and_then(Value::as_str).unwrap_or_default().to_string(),
+        Err(_) => body.to_string(),
+    };
+    match ip.parse::<IpAddr>() {
+        Ok(a) => Ok(a.to_string()),
+        Err(_) => bail!("返回内容不是 IP 地址"),
+    }
 }
 
 pub struct HttpResult {
@@ -144,6 +179,7 @@ pub fn port_open(host: &str, port: u16) -> bool {
 }
 
 /// sing-box 内置的 Clash API（只监听 127.0.0.1）。
+#[derive(Clone)]
 pub struct ClashApi {
     base: String,
     secret: String,
@@ -178,19 +214,75 @@ impl ClashApi {
 
     /// 经指定出站请求 url 的耗时（毫秒）。对线路测的是“线路握手 + 请求”，对 exit 测的是整条链。
     pub fn delay(&self, outbound: &str, url: &str, timeout_ms: u32) -> Result<u64> {
-        let v = self.get(&format!("/proxies/{}/delay?timeout={timeout_ms}&url={}", enc(outbound), enc(url)))?;
+        let v = self.get(&format!("/proxies/{}/delay?timeout={timeout_ms}&url={}", enc(outbound), enc(&api_url(url))))?;
         v.get("delay").and_then(Value::as_u64).context("返回内容缺少 delay")
     }
 
     /// 让整组重新测速；urltest 组会据此立即重新选线。返回成功线路的延迟。
     pub fn group_delay(&self, group: &str, url: &str, timeout_ms: u32) -> Result<serde_json::Map<String, Value>> {
-        let v = self.get(&format!("/group/{}/delay?timeout={timeout_ms}&url={}", enc(group), enc(url)))?;
+        let v = self.get(&format!("/group/{}/delay?timeout={timeout_ms}&url={}", enc(group), enc(&api_url(url))))?;
         Ok(v.as_object().cloned().unwrap_or_default())
     }
 
     /// 线路组当前选中的线路。
     pub fn current_line(&self) -> Option<String> {
         self.get("/proxies/lines").ok()?.get("now")?.as_str().map(str::to_string)
+    }
+
+    /// 把 selector 组切到指定的出站。
+    pub fn select(&self, group: &str, name: &str) -> Result<()> {
+        let url = format!("{}/proxies/{}", self.base, enc(group));
+        let mut req = self.agent.request("PUT", &url).set("Content-Type", "application/json");
+        if !self.secret.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.secret));
+        }
+        match req.send_string(&serde_json::json!({ "name": name }).to_string()) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, r)) => bail!("Clash API 返回 {code}：{}", r.into_string().unwrap_or_default().trim()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 此刻经指定入站的连接数（线路控制器据此决定探测得多勤）。
+    pub fn connections_on(&self, inbound: &str) -> Option<usize> {
+        let v = self.get("/connections").ok()?;
+        let suffix = format!("/{inbound}");
+        Some(v["connections"].as_array().map_or(0, |a| {
+            a.iter().filter(|c| c["metadata"]["type"].as_str().is_some_and(|t| t.ends_with(&suffix))).count()
+        }))
+    }
+
+    /// 当前 Clash 模式（出口锁定用 Lock / Open）。
+    pub fn mode(&self) -> Option<String> {
+        self.get("/configs").ok()?.get("mode")?.as_str().map(str::to_string)
+    }
+
+    /// 切换 Clash 模式，并读回确认已生效（不认识的模式会被内核忽略）。
+    pub fn set_mode(&self, mode: &str) -> Result<()> {
+        let url = format!("{}/configs", self.base);
+        let mut req = self.agent.request("PATCH", &url).set("Content-Type", "application/json");
+        if !self.secret.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.secret));
+        }
+        match req.send_string(&serde_json::json!({ "mode": mode }).to_string()) {
+            Ok(_) => {}
+            Err(ureq::Error::Status(code, r)) => bail!("Clash API 返回 {code}：{}", r.into_string().unwrap_or_default().trim()),
+            Err(e) => return Err(e.into()),
+        }
+        match self.mode() {
+            Some(m) if m.eq_ignore_ascii_case(mode) => Ok(()),
+            other => bail!("切换到 {mode} 后读回的模式是 {}", other.as_deref().unwrap_or("未知")),
+        }
+    }
+}
+
+/// 发给 Clash API 的测速地址。sing-box 会把 http:// 开头的地址换成它自己的默认地址（照顾面板的旧习惯），
+/// 但只认小写；实测（1.14）把协议名写成大写，就按原样用 HTTP 测。以后的版本要是连大写也换掉，
+/// 结果是改测它的默认 HTTPS 地址，探测仍然有效，只是不再是配置里写的那个地址。
+fn api_url(url: &str) -> String {
+    match url.strip_prefix("http://") {
+        Some(rest) => format!("HTTP://{rest}"),
+        None => url.to_string(),
     }
 }
 
@@ -212,6 +304,12 @@ mod tests {
         assert!(same_ip("203.0.113.10", " 203.0.113.10\n"));
         assert!(same_ip("2001:db8::1", "2001:0db8:0:0:0:0:0:1"));
         assert!(!same_ip("203.0.113.10", "203.0.113.11"));
+    }
+
+    #[test]
+    fn http_probe_urls_are_sent_with_an_uppercase_scheme() {
+        assert_eq!(api_url("http://127.0.0.1:8080/204"), "HTTP://127.0.0.1:8080/204");
+        assert_eq!(api_url("https://www.gstatic.com/generate_204"), "https://www.gstatic.com/generate_204");
     }
 
     #[test]

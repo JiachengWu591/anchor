@@ -29,6 +29,8 @@ const ID_STATUS: usize = 1;
 const ID_TIMELINE: usize = 10;
 const ID_CHECK: usize = 11;
 const ID_FOLDER: usize = 12;
+const ID_RECHECK: usize = 13;
+const ID_REPORT: usize = 14;
 const ID_RELOAD: usize = 20;
 const ID_QUIT: usize = 30;
 const CREATE_NEW_CONSOLE: u32 = 0x10;
@@ -138,7 +140,9 @@ fn show_menu(hwnd: HWND) {
         item(MF_STRING | MF_GRAYED, ID_STATUS, &format!("AI Anchor：{text}"));
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, ID_TIMELINE, "查看时间线（最近 24 小时）");
+        item(MF_STRING, ID_REPORT, "断联报告（最近 7 天）");
         item(MF_STRING, ID_CHECK, "运行体检");
+        item(MF_STRING, ID_RECHECK, "立即核对出口");
         item(MF_STRING, ID_FOLDER, "打开数据目录");
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, ID_RELOAD, "重新加载配置");
@@ -151,7 +155,12 @@ fn show_menu(hwnd: HWND) {
         DestroyMenu(m);
         match cmd {
             ID_TIMELINE => run_cli(&["timeline", "--since", "24h"]),
+            ID_REPORT => run_cli(&["report", "--since", "7d"]),
             ID_CHECK => run_cli(&["check"]),
+            ID_RECHECK => {
+                sh.recheck.store(true, Ordering::SeqCst);
+                sh.poke();
+            }
             ID_FOLDER => {
                 let explorer = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("explorer.exe");
                 let _ = std::process::Command::new(explorer).arg(&sh.paths.home).spawn();

@@ -37,10 +37,11 @@ pub fn find_singbox(cfg: &Config, paths: &Paths) -> Result<PathBuf> {
     })
 }
 
-pub fn write_config(cfg: &Config, paths: &Paths) -> Result<PathBuf> {
+/// exit_lock：AI 通道以锁住状态启动，等用户代理核对出口后放行（见 singbox::generate）。
+pub fn write_config(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<PathBuf> {
     std::fs::create_dir_all(paths.run_dir())?;
     std::fs::create_dir_all(paths.log_dir())?;
-    let v = singbox::generate(cfg, paths)?;
+    let v = singbox::generate(cfg, paths, exit_lock)?;
     let p = paths.singbox_json();
     std::fs::write(&p, serde_json::to_string_pretty(&v)?)?;
     Ok(p)
@@ -100,18 +101,25 @@ pub enum KernelEvent {
     Stopped,
 }
 
-/// 预检：找到 sing-box，写入并校验配置，确认 AI 端口空闲。返回 (sing-box 路径, 配置路径)。
-pub fn prepare(cfg: &Config, paths: &Paths) -> Result<(PathBuf, PathBuf)> {
+/// 预检：找到 sing-box，写入并校验配置，确认 AI 端口和探测端口空闲。返回 (sing-box 路径, 配置路径)。
+pub fn prepare(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<(PathBuf, PathBuf)> {
     let sb = find_singbox(cfg, paths)?;
-    let json = write_config(cfg, paths)?;
+    rotate_log(&paths.log_dir().join("sing-box.log"), 20 << 20);
+    let json = write_config(cfg, paths, exit_lock)?;
     check_config(&sb, &json)?;
-    if net::port_open(&cfg.proxy.listen, cfg.proxy.port) {
-        bail!(
-            "{} 已被占用：可能已经有 anchor-agent 或 anchor up 在运行，或被其他程序占用",
-            host_port(&cfg.proxy.listen, cfg.proxy.port)
-        );
+    for (host, port) in [(cfg.proxy.listen.as_str(), cfg.proxy.port), ("127.0.0.1", cfg.probe_port())] {
+        if net::port_open(host, port) {
+            bail!("{} 已被占用：可能已经有 anchor-agent 或 anchor up 在运行，或被其他程序占用", host_port(host, port));
+        }
     }
     Ok((sb, json))
+}
+
+/// 内核启动前：日志超过 max 字节就改名为 .log.1（覆盖上一份），sing-box 自己不轮转。
+fn rotate_log(log: &Path, max: u64) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > max) {
+        let _ = std::fs::rename(log, log.with_extension("log.1"));
+    }
 }
 
 pub struct Options {

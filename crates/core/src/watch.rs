@@ -1,4 +1,5 @@
-//! 线路看门狗：每隔 watch_interval 探测当前线路，失败时立即让 sing-box 重新选线。
+//! 线路看门狗（只给前台调试的 anchor up 用；用户代理里由线路控制器 linectl 选线）：
+//! 每隔 watch_interval 探测当前线路，失败时立即让 sing-box 重新选线。
 //!
 //! sing-box 的 urltest 只在定时检测时换线（默认 30 秒一次），连接失败不会立刻触发，
 //! 当前线路断开后新连接会持续失败到下一轮检测。实测调用一次 Clash API 的组测速

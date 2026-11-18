@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 use windows_service::service::{
-    ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions, ServiceFailureResetPeriod,
-    ServiceInfo, ServiceStartType, ServiceState, ServiceType,
+    Service, ServiceAccess, ServiceAction, ServiceActionType, ServiceErrorControl, ServiceFailureActions,
+    ServiceFailureResetPeriod, ServiceInfo, ServiceStartType, ServiceState, ServiceType,
 };
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
@@ -58,10 +58,36 @@ fn icacls(args: &[&str]) -> Result<()> {
 }
 
 /// 只允许 SYSTEM 和管理员写，普通用户只读。用 SID 写，不依赖系统语言里的组名。
+///
+/// 显式权限只设在目录上（带继承标志），目录里已有的文件改为从目录继承。
+///
+/// 旧版这里用 /T 把带 (OI)(CI) 的授权直接套到了文件上：重装时 svc.log 已经存在，
+/// 它的权限列表因此变成空的，谁都打不开（临时目录里复现过），连改所有者都会失败，
+/// 第二次重装就卡在这里。所以只有目录本身的设置失败才中止；已有文件先重设为继承
+/// （管理员组是它们的所有者，总能改权限），还打不开的就删掉（管理员对目录有完全控制，可以删其中的文件）。
 fn lock_down(dir: &Path) -> Result<()> {
-    let d = dir.to_string_lossy();
-    icacls(&[&d, "/setowner", "*S-1-5-32-544", "/T", "/Q"])?;
-    icacls(&[&d, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/T", "/Q"])
+    let d = dir.to_string_lossy().trim_end_matches('\\').to_string();
+    icacls(&[&d, "/setowner", "*S-1-5-32-544", "/Q"])?;
+    icacls(&[&d, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "*S-1-5-32-545:(OI)(CI)RX", "/Q"])?;
+    if std::fs::read_dir(dir)?.next().is_none() {
+        return Ok(());
+    }
+    let children = format!("{d}\\*");
+    if let Err(e) = icacls(&[&children, "/reset", "/T", "/C", "/Q"]) {
+        println!("提示：重设已有文件的权限时有错误，下面逐个检查：{e:#}");
+    }
+    let _ = icacls(&[&children, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"]);
+    for e in std::fs::read_dir(dir)?.flatten() {
+        let p = e.path();
+        // 用目录项里的类型，不打开文件：权限损坏的文件连属性都读不了
+        if e.file_type().is_ok_and(|t| t.is_file()) && std::fs::File::open(&p).is_err() {
+            match std::fs::remove_file(&p) {
+                Ok(()) => println!("已删除权限损坏、无法访问的旧文件 {}", p.display()),
+                Err(err) => bail!("{} 无法访问，也删不掉：{err}", p.display()),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn wait_state(svc: &windows_service::service::Service, want: ServiceState, timeout: Duration) -> bool {
@@ -90,6 +116,16 @@ pub fn install(user_sid: Option<String>, home: Option<PathBuf>) -> Result<()> {
         println!("提示：{} 还没有 anchor.toml，服务在读到有效配置之前不会改动任何守卫规则。", home.display());
     }
 
+    // 1. 状态目录：重设所有者和访问控制，再写登记信息。不需要停服务，所以先做：
+    //    这一步出错时旧服务照常运行，守卫维护不中断
+    let data = data_dir();
+    std::fs::create_dir_all(&data)?;
+    lock_down(&data)?;
+    let state = SvcState { user_sid: sid.clone(), home: home.clone() };
+    let sf = state_file();
+    let _ = std::fs::remove_file(&sf);
+    std::fs::write(&sf, toml::to_string(&state)?)?;
+
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
     let access = ServiceAccess::QUERY_STATUS | ServiceAccess::START | ServiceAccess::STOP | ServiceAccess::CHANGE_CONFIG;
     let existing = manager.open_service(SERVICE_NAME, access).ok();
@@ -103,32 +139,48 @@ pub fn install(user_sid: Option<String>, home: Option<PathBuf>) -> Result<()> {
         }
     }
 
-    // 1. 程序复制到只有管理员能写的目录
-    let dir = program_dir();
-    std::fs::create_dir_all(&dir)?;
-    let exe = dir.join("anchor-svc.exe");
-    let me = std::env::current_exe()?;
-    if !anchor_core::util::same_path(&me, &exe) {
-        std::fs::copy(&me, &exe).with_context(|| format!("复制到 {} 失败", exe.display()))?;
+    // 2. 复制程序、注册或更新服务。旧服务已经停了：这里出错就把服务重新启动，免得守卫维护就此停下
+    let exe = program_dir().join("anchor-svc.exe");
+    let had_service = existing.is_some();
+    let svc = match copy_and_register(&manager, existing, &exe, access) {
+        Ok(svc) => svc,
+        Err(e) => {
+            if had_service
+                && let Ok(old) = manager.open_service(SERVICE_NAME, ServiceAccess::START)
+                && old.start::<&str>(&[]).is_ok()
+            {
+                println!("安装没有完成，已重新启动原来的服务，守卫维护没有中断。");
+            }
+            return Err(e);
+        }
+    };
+    svc.start::<&str>(&[])?;
+    if !wait_state(&svc, ServiceState::Running, Duration::from_secs(15)) {
+        bail!("服务没有在 15 秒内启动，查看日志：{}", log_file().display());
     }
+    println!("已安装并启动服务 {SERVICE_NAME}（{DISPLAY_NAME}）。");
+    println!("  程序      {}", exe.display());
+    println!("  登记用户  {sid}");
+    println!("  数据目录  {}", home.display());
+    println!("  服务日志  {}", log_file().display());
+    println!("服务会立即刷新一次守卫规则，之后应用安装或更新时自动刷新，并每 5 分钟检查一次。");
+    Ok(())
+}
 
-    // 2. 状态目录：重设所有者和访问控制，再写登记信息
-    let data = data_dir();
-    std::fs::create_dir_all(&data)?;
-    lock_down(&data)?;
-    let state = SvcState { user_sid: sid.clone(), home: home.clone() };
-    let sf = state_file();
-    let _ = std::fs::remove_file(&sf);
-    std::fs::write(&sf, toml::to_string(&state)?)?;
-
-    // 3. 注册或更新服务：开机自启，失败后 5 秒重启
+/// 程序复制到只有管理员能写的目录，注册或更新服务：开机自启，失败后 5 秒重启。
+fn copy_and_register(manager: &ServiceManager, existing: Option<Service>, exe: &Path, access: ServiceAccess) -> Result<Service> {
+    std::fs::create_dir_all(program_dir())?;
+    let me = std::env::current_exe()?;
+    if !anchor_core::util::same_path(&me, exe) {
+        std::fs::copy(&me, exe).with_context(|| format!("复制到 {} 失败", exe.display()))?;
+    }
     let info = ServiceInfo {
         name: OsString::from(SERVICE_NAME),
         display_name: OsString::from(DISPLAY_NAME),
         service_type: ServiceType::OWN_PROCESS,
         start_type: ServiceStartType::AutoStart,
         error_control: ServiceErrorControl::Normal,
-        executable_path: exe.clone(),
+        executable_path: exe.to_path_buf(),
         launch_arguments: vec![OsString::from("service")],
         dependencies: vec![],
         account_name: None,
@@ -149,17 +201,7 @@ pub fn install(user_sid: Option<String>, home: Option<PathBuf>) -> Result<()> {
         command: None,
         actions: Some(vec![restart.clone(), restart.clone(), restart]),
     })?;
-    svc.start::<&str>(&[])?;
-    if !wait_state(&svc, ServiceState::Running, Duration::from_secs(15)) {
-        bail!("服务没有在 15 秒内启动，查看日志：{}", log_file().display());
-    }
-    println!("已安装并启动服务 {SERVICE_NAME}（{DISPLAY_NAME}）。");
-    println!("  程序      {}", exe.display());
-    println!("  登记用户  {sid}");
-    println!("  数据目录  {}", home.display());
-    println!("  服务日志  {}", log_file().display());
-    println!("服务会立即刷新一次守卫规则，之后应用安装或更新时自动刷新，并每 5 分钟检查一次。");
-    Ok(())
+    Ok(svc)
 }
 
 pub fn uninstall() -> Result<()> {

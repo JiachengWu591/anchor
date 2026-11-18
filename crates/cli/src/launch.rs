@@ -21,7 +21,11 @@ pub fn readiness(cfg: &Config) -> Result<String> {
     if cfg.expect.ip.trim().is_empty() {
         bail!("还没有登记出口基线：先运行 anchor baseline");
     }
-    let agent = net::agent_via_proxy(cfg, Duration::from_secs(10))?;
+    if let Some(why) = crate::agentctl::exit_locked_reason() {
+        bail!("AI 通道{why}。已拒绝启动。");
+    }
+    // 经探测入站核对：与 AI 通道同一个出口
+    let agent = net::agent_for_checks(cfg, Duration::from_secs(10))?;
     let info = net::fetch_exit(&agent, &cfg.check)
         .context("经通道访问 IP 回显服务失败，线路或出口可能不可用；运行 anchor check 查看是哪一段")?;
     if !net::same_ip(&info.ip, &cfg.expect.ip) {

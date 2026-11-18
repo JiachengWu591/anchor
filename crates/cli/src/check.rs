@@ -155,7 +155,8 @@ pub fn run(cfg: &Config) -> Report {
             let path = if cfg.lines.is_empty() { "出口 → 目标" } else { "线路 → 出口 → 目标" };
             p.push(Probe { latency_ms: Some(ms), ..probe(EXIT, "整条链路", St::Pass, None, path) });
         }
-        match net::agent_via_proxy(cfg, Duration::from_secs(10)).and_then(|a| net::fetch_exit(&a, &cfg.check)) {
+        // 经探测入站：AI 通道被出口锁定时也能看到现在的出口
+        match net::agent_for_checks(cfg, Duration::from_secs(10)).and_then(|a| net::fetch_exit(&a, &cfg.check)) {
             Ok(info) => {
                 let (st, detail) = if cfg.expect.ip.trim().is_empty() {
                     (St::Warn, format!("实际 {}；还没有登记基线（anchor baseline）", info.ip))
@@ -170,12 +171,15 @@ pub fn run(cfg: &Config) -> Report {
             }
             Err(e) => p.push(probe(EXIT, "出口 IP", St::Fail, None, format!("经通道访问失败：{e:#}"))),
         }
+        if let Some(x) = lock_probe() {
+            p.push(x);
+        }
     } else {
         p.push(probe(EXIT, "出口 IP", St::Skip, None, "内核未运行"));
     }
 
     // 5. AI 服务：官方状态页 + 关键域名可达性
-    match (core_up, net::agent_via_proxy(cfg, Duration::from_secs(10))) {
+    match (core_up, net::agent_for_checks(cfg, Duration::from_secs(10))) {
         (true, Ok(agent)) => {
             for (vendor, url) in STATUS_PAGES {
                 p.push(status_page(&agent, vendor, url));
@@ -199,6 +203,23 @@ pub fn run(cfg: &Config) -> Report {
 
     let verdict = attribute(&p, !cfg.lines.is_empty(), tunnel.as_ref().map(|t| t.name.as_str()));
     Report { time: now_rfc3339(), healthy: !p.iter().any(|x| x.status == St::Fail), verdict, exit: exit_info, probes: p }
+}
+
+/// 用户代理的出口锁定状态（没有用户代理时没有这一项）。
+fn lock_probe() -> Option<Probe> {
+    let v = crate::agentctl::call("status", Value::Null).ok()?;
+    lock_probe_from(&v["status"]["exit"])
+}
+
+fn lock_probe_from(e: &Value) -> Option<Probe> {
+    let line = crate::agentctl::exit_line(e)?;
+    let st = match e["state"].as_str().unwrap_or("") {
+        "open" => St::Pass,
+        "verifying" if !e["exit_down"].as_bool().unwrap_or(false) => St::Warn,
+        "no_baseline" => St::Warn,
+        _ => St::Fail,
+    };
+    Some(probe(EXIT, "AI 通道", st, None, line.trim_start_matches("AI 通道").trim()))
 }
 
 /// 官方状态页是服务商的公告，不是 AI Anchor 测到的故障：最多标 WARN，由结论单独说明；
@@ -306,7 +327,20 @@ fn consistency(cfg: &Config, exit: Option<&ExitInfo>, p: &mut Vec<Probe>) {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     p.push(probe(CONS, "系统时区", St::Info, None, format!("{sys_tz}（网页和桌面客户端读取的是系统时区）")));
-    p.push(probe(CONS, "DNS / WebRTC 泄露", St::Skip, None, "P1：在 AI 专用浏览器内检测"));
+    p.push(dns_probe(cfg));
+    p.push(probe(CONS, "WebRTC 泄露", St::Skip, None, "P1c：在 AI 专用浏览器内检测"));
+}
+
+/// AI 域名在哪里解析。direct 出口由内核在本机解析：没经出口加密解析的话，查询可能绕过 VPN 明文发到本地网络。
+fn dns_probe(cfg: &Config) -> Probe {
+    const NAME: &str = "DNS";
+    if !crate::singbox::is_direct_exit(cfg) {
+        return probe(CONS, NAME, St::Pass, None, "AI 域名交给出口服务器解析，不经本机 DNS");
+    }
+    match cfg.exit.outbound.get("domain_resolver") {
+        None => probe(CONS, NAME, St::Pass, None, format!("direct 出口：AI 域名经出口用加密 DNS（DoH {}）解析，不经本地网络", cfg.dns.exit_doh.trim())),
+        Some(r) => probe(CONS, NAME, St::Warn, None, format!("direct 出口用了自定义的 domain_resolver {r}：确认它经出口解析，否则 AI 域名的查询可能绕过 VPN")),
+    }
 }
 
 /// 按设计文档的归因顺序：本地 → 内核 → 线路 → 出口 → 服务端。
@@ -456,6 +490,32 @@ mod tests {
 
     fn target(path: &str) -> crate::guard::Target {
         crate::guard::Target { label: "Claude 桌面版".into(), path: path.into() }
+    }
+
+    #[test]
+    fn dns_item_reflects_where_ai_domains_are_resolved() {
+        let cfg = |s: &str| Config::parse(s).unwrap();
+        let socks = dns_probe(&cfg("[exit]\ntype = \"socks\"\nserver = \"203.0.113.10\"\nserver_port = 1080\n"));
+        assert_eq!(socks.status, St::Pass);
+        assert!(socks.detail.contains("出口服务器"));
+        let direct = dns_probe(&cfg("[exit]\ntype = \"direct\"\n"));
+        assert_eq!(direct.status, St::Pass);
+        assert!(direct.detail.contains("DoH 1.1.1.1"), "{}", direct.detail);
+        let custom = dns_probe(&cfg("[exit]\ntype = \"direct\"\ndomain_resolver = \"local\"\n"));
+        assert_eq!(custom.status, St::Warn);
+    }
+
+    #[test]
+    fn exit_lock_shows_up_and_is_attributed_to_the_exit() {
+        use serde_json::json;
+        assert_eq!(lock_probe_from(&json!({ "state": "open", "baseline": "1.1.1.1" })).unwrap().status, St::Pass);
+        assert_eq!(lock_probe_from(&json!({ "state": "verifying" })).unwrap().status, St::Warn);
+        let changed = lock_probe_from(&json!({ "state": "changed", "baseline": "1.1.1.1", "actual": "2.2.2.2" })).unwrap();
+        assert_eq!(changed.status, St::Fail);
+        assert_eq!(changed.segment, EXIT);
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), changed];
+        assert!(attribute(&p, false, None).contains("出口"));
+        assert!(lock_probe_from(&json!({})).is_none(), "用户代理还没开始核对");
     }
 
     #[test]

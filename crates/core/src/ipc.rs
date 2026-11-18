@@ -32,8 +32,26 @@ use windows_sys::Win32::System::Pipes::{
 };
 
 pub const PROTO: u32 = 1;
+/// 默认数据目录（%LOCALAPPDATA%\AIAnchor）的用户代理管道。
 pub const AGENT_PIPE: &str = r"\\.\pipe\ai-anchor-agent";
 pub const SVC_PIPE: &str = r"\\.\pipe\ai-anchor-svc";
+
+/// 某个数据目录的用户代理管道。默认数据目录用 AGENT_PIPE；其他数据目录各用一个（按路径区分），
+/// 这样 `anchor --home X` 只会找到 X 的用户代理，不同数据目录的用户代理也能同时运行。
+pub fn agent_pipe(home: &std::path::Path) -> String {
+    let norm = |p: &std::path::Path| p.to_string_lossy().trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+    let home = norm(home);
+    let default = std::env::var_os("LOCALAPPDATA").map(|b| norm(&std::path::PathBuf::from(b).join("AIAnchor")));
+    if default.is_none_or(|d| d == home) {
+        return AGENT_PIPE.to_string();
+    }
+    let mut h: u32 = 0x811c_9dc5;
+    for b in home.bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    format!("{AGENT_PIPE}-{h:08x}")
+}
 const MAX_MSG: u64 = 1 << 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +299,18 @@ pub fn wake(pipe: &str) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_pipe_is_per_data_directory() {
+        use std::path::{Path, PathBuf};
+        let def = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join("AIAnchor");
+        assert_eq!(agent_pipe(&def), AGENT_PIPE, "默认数据目录沿用原来的管道名");
+        assert_eq!(agent_pipe(Path::new(&format!("{}\\", def.display()))), AGENT_PIPE);
+        let other = agent_pipe(Path::new(r"D:\anchor-test"));
+        assert!(other.starts_with(AGENT_PIPE) && other != AGENT_PIPE, "{other}");
+        assert_eq!(other, agent_pipe(Path::new(r"d:/ANCHOR-TEST/")), "大小写、斜杠不同算同一个目录");
+        assert_ne!(other, agent_pipe(Path::new(r"D:\anchor-test2")));
+    }
 
     #[test]
     fn round_trip_over_a_real_pipe() {

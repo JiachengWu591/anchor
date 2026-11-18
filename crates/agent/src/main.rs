@@ -4,7 +4,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod disconnects;
+mod exitguard;
 mod guardpoll;
+mod health;
+mod lines;
 mod session;
 mod shared;
 mod tray;
@@ -59,7 +63,8 @@ fn real_main(args: Args) -> Result<()> {
     log::init(Some(paths.agent_log()), args.no_tray || cfg!(debug_assertions));
 
     let sid = win::current_user_sid()?;
-    let listener = match ipc::Listener::bind(ipc::AGENT_PIPE, &ipc::sddl(&["SY", &sid], &[])) {
+    let pipe = ipc::agent_pipe(&paths.home);
+    let listener = match ipc::Listener::bind(&pipe, &ipc::sddl(&["SY", &sid], &[])) {
         Ok(l) => l,
         Err(e) if e.is::<AlreadyRunning>() => {
             log::line("已经有一个 anchor-agent 在运行，本次退出");
@@ -72,6 +77,21 @@ fn real_main(args: Args) -> Result<()> {
     tl.event("agent_start", json!({ "version": anchor_core::VERSION, "pid": std::process::id(), "home": paths.home }));
     log::line(&format!("anchor-agent {} 启动；数据目录 {}", anchor_core::VERSION, paths.home.display()));
     let sh = Arc::new(Shared::new(paths, tl, !args.no_tray));
+
+    // 网卡地址、默认路由变化（VPN 重连、换网络）：出口核对据此先锁住再核对
+    let _netwatch = {
+        let s = sh.clone();
+        match anchor_core::netwatch::NetWatch::start(move || {
+            s.net_gen.fetch_add(1, Ordering::SeqCst);
+            s.poke();
+        }) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                log::line(&format!("无法监听网络变化，只靠定时核对出口：{e:#}"));
+                None
+            }
+        }
+    };
 
     let pipe_stop = Arc::new(AtomicBool::new(false));
     {
@@ -87,6 +107,11 @@ fn real_main(args: Args) -> Result<()> {
         let sh = sh.clone();
         thread::spawn(move || guardpoll::run(sh));
     }
+    // 断联采集：实时读 sing-box 日志
+    let disconnect_thread = {
+        let sh = sh.clone();
+        thread::spawn(move || disconnects::run(sh))
+    };
     {
         let sh = sh.clone();
         thread::spawn(move || maintenance(sh));
@@ -104,8 +129,9 @@ fn real_main(args: Args) -> Result<()> {
     }
     sh.request_stop("托盘退出");
     let _ = sessions.join();
+    let _ = disconnect_thread.join();
     pipe_stop.store(true, Ordering::SeqCst);
-    ipc::wake(ipc::AGENT_PIPE);
+    ipc::wake(&pipe);
     sh.tl.event("agent_stop", json!({ "reason": sh.stop_reason() }));
     log::line(&format!("anchor-agent 已退出（{}）", sh.stop_reason()));
     Ok(())

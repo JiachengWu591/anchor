@@ -6,7 +6,10 @@
 
 mod agentctl;
 mod check;
+mod exitcmd;
 mod launch;
+mod linecmd;
+mod report;
 mod sandbox;
 mod svcctl;
 mod timeline;
@@ -93,8 +96,29 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// 断联报告：断联次数、各段占比、“未知”占比，出口、线路、内核、网络的变化
+    Report {
+        /// 统计多久以内的，例如 24h、7d
+        #[arg(long, default_value = "7d")]
+        since: humantime::Duration,
+        /// 同时列出每一次断联
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// 扫描本机已安装的 AI 程序
     Scan,
+    /// 出口：核对与锁定
+    Exit {
+        #[command(subcommand)]
+        action: ExitCmd,
+    },
+    /// 线路：看评分、手动换线、固定（换线不改变出口 IP）
+    Line {
+        #[command(subcommand)]
+        action: LineCmd,
+    },
     /// 防火墙守卫：保证 AI 程序只能经 AI 通道联网
     Guard {
         #[command(subcommand)]
@@ -153,6 +177,36 @@ enum AgentCmd {
     Install,
     /// 取消登录后自动启动，并退出
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum LineCmd {
+    /// 各线路最近 5 分钟的成功率、延迟中位数，当前用哪条
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 手动换到这条线路（已建立的连接留在原线路上）
+    Use { name: String },
+    /// 固定在这条线路：不再自动换线，重启后仍然有效
+    Pin { name: String },
+    /// 取消固定
+    Unpin,
+}
+
+#[derive(Subcommand)]
+enum ExitCmd {
+    /// 立即核对出口：先锁住 AI 通道，与基线一致后放行（和网络变化时一样）
+    Check,
+    /// 列出主出口和备用出口、各自登记的基线，现在用的是哪个
+    List,
+    /// 切换到另一个出口（AI 服务看到的 IP 会改变）：先关闭正在运行的 AI 程序，切换后重新打开
+    Use {
+        name: String,
+        /// 不询问，直接关闭 AI 程序并切换
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -215,6 +269,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Gen { .. }
             | Cmd::Up
             | Cmd::Baseline { .. }
+            | Cmd::Exit { action: ExitCmd::Use { .. } }
             | Cmd::Launch { .. }
             | Cmd::Browser { .. }
             | Cmd::Repair
@@ -224,6 +279,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
 
 fn real_main(cli: Cli) -> Result<i32> {
     let paths = Paths::resolve(cli.home)?;
+    agentctl::init(&paths);
     let pkg = if unsafe_in_package(&cli.cmd) || matches!(cli.cmd, Cmd::Check { .. }) { win::sandbox() } else { None };
     if !matches!(cli.cmd, Cmd::Rules { .. } | Cmd::Repair) {
         sandbox::warn_private_copies(&paths);
@@ -251,6 +307,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         },
         Cmd::Up => up(&paths)?,
         Cmd::Status => status(&paths)?,
+        Cmd::Report { since, list, json } => report::run(&paths, since.into(), list, json)?,
         Cmd::Timeline { since, kind, probes, limit, json } => {
             timeline::print(&paths, &timeline::Query { since: since.into(), kinds: kind, probes, limit, json })?
         }
@@ -274,6 +331,17 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Baseline { yes } => baseline(&paths, yes)?,
         Cmd::Scan => scan(&paths),
         Cmd::Guard { action } => guard_cmd(&paths, action)?,
+        Cmd::Exit { action } => match action {
+            ExitCmd::Check => agentctl::exit_check()?,
+            ExitCmd::List => exitcmd::list(&paths)?,
+            ExitCmd::Use { name, yes } => exitcmd::use_exit(&paths, &name, yes)?,
+        },
+        Cmd::Line { action } => match action {
+            LineCmd::List { json } => linecmd::list(json)?,
+            LineCmd::Use { name } => linecmd::use_line(&name)?,
+            LineCmd::Pin { name } => linecmd::pin(&name)?,
+            LineCmd::Unpin => linecmd::unpin()?,
+        },
         Cmd::Run { program, args } => return launch::run_cli(&Config::load(&paths)?, &program, &args),
         Cmd::Launch { app, pause_on_error } => {
             pause_if_err(pause_on_error, || launch::launch_desktop(&Config::load(&paths)?, &app))?
@@ -346,11 +414,12 @@ fn init(paths: &Paths, force: bool) -> Result<()> {
 
 fn gen_config(paths: &Paths, stdout: bool) -> Result<()> {
     let cfg = Config::load(paths)?;
+    // 与用户代理运行的配置一致（带出口锁定）
     if stdout {
-        println!("{}", serde_json::to_string_pretty(&singbox::generate(&cfg, paths)?)?);
+        println!("{}", serde_json::to_string_pretty(&singbox::generate(&cfg, paths, true)?)?);
         return Ok(());
     }
-    let p = kernel::write_config(&cfg, paths)?;
+    let p = kernel::write_config(&cfg, paths, true)?;
     println!("已生成 sing-box 配置：{}", p.display());
     match kernel::find_singbox(&cfg, paths) {
         Ok(sb) => {
@@ -371,7 +440,9 @@ fn up(paths: &Paths) -> Result<()> {
         bail!("anchor-agent 正在运行，它已经在守护内核。要前台调试，先运行 anchor agent stop");
     }
     let cfg = Config::load(paths)?;
-    let (sb, json) = kernel::prepare(&cfg, paths)?;
+    // 前台调试没有人核对出口，不启用出口锁定
+    let (sb, json) = kernel::prepare(&cfg, paths, false)?;
+    println!("注意：anchor up 不核对出口，也不会在出口 IP 变化时锁住 AI 通道；日常请用 anchor agent start。");
     let stop = Arc::new(AtomicBool::new(false));
     {
         let s = stop.clone();
@@ -425,7 +496,8 @@ fn baseline(paths: &Paths, yes: bool) -> Result<()> {
     if !net::port_open(&cfg.proxy.listen, cfg.proxy.port) {
         bail!("内核未运行：先启动 AI Anchor（anchor agent start）");
     }
-    let agent = net::agent_via_proxy(&cfg, Duration::from_secs(10))?;
+    // 经探测入站：AI 通道因出口变化被锁住时，也能测到现在的出口
+    let agent = net::agent_for_checks(&cfg, Duration::from_secs(10))?;
     let info = net::fetch_exit(&agent, &cfg.check)?;
     println!("经通道测得的出口：");
     println!("  IP    {}", info.ip);
@@ -442,6 +514,10 @@ fn baseline(paths: &Paths, yes: bool) -> Result<()> {
     }
     config::set_expect(paths, &info)?;
     println!("已写入 {}", paths.config().display());
+    if agentctl::running() {
+        // 用户代理按新基线重新核对；出口因 IP 变化被锁住时，这一步就是确认新 IP
+        agentctl::reload()?;
+    }
     Ok(())
 }
 
@@ -500,6 +576,9 @@ fn status(paths: &Paths) -> Result<()> {
             // 配置错误上面已经单独显示过
             if let Some(e) = st["kernel_error"].as_str().or(st["config_error"].as_str().filter(|_| cfg.is_ok())) {
                 println!("      {e}");
+            }
+            if let Some(line) = agentctl::exit_line(&st["exit"]) {
+                println!("{line}");
             }
         }
         None => {
@@ -561,7 +640,7 @@ fn status(paths: &Paths) -> Result<()> {
 fn status_routes(cfg: &Config, up: bool) {
     println!("出口  {}；基线 IP {}", cfg.exit.label(), if cfg.expect.ip.is_empty() { "未登记" } else { &cfg.expect.ip });
     if !cfg.backup_exits.is_empty() {
-        println!("      备用出口 {} 个（P1b 起支持确认后切换）", cfg.backup_exits.len());
+        println!("      现在用的是 {}；共 {} 个出口（anchor exit list / anchor exit use <名称>）", cfg.exit_name(), cfg.exits.len());
     }
 
     if cfg.lines.is_empty() {
@@ -573,7 +652,7 @@ fn status_routes(cfg: &Config, up: bool) {
         };
         let api = net::ClashApi::new(&cfg);
         let current = if up { api.current_line() } else { None };
-        println!("线路  {} 条，{mode}；当前 {}", cfg.lines.len(), current.as_deref().unwrap_or("未知"));
+        println!("线路  {} 条，{mode}；当前 {}（评分和换线：anchor line list）", cfg.lines.len(), current.as_deref().unwrap_or("未知"));
         for l in &cfg.lines {
             let name = l.name.as_deref().unwrap_or_default();
             let last = if up {
