@@ -71,7 +71,8 @@ pub fn install(paths: &Paths) -> Result<()> {
     }
     if running() {
         println!("特权服务已安装并运行。");
-        print_status(false)?;
+        // 刚启动的服务可能还没做完第一次刷新，状态是空的；要一次刷新后的结果，免得显示“0 条规则”
+        print_status(true)?;
     }
     Ok(())
 }

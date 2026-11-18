@@ -179,6 +179,7 @@ pub fn port_open(host: &str, port: u16) -> bool {
 }
 
 /// sing-box 内置的 Clash API（只监听 127.0.0.1）。
+#[derive(Clone)]
 pub struct ClashApi {
     base: String,
     secret: String,
@@ -213,19 +214,42 @@ impl ClashApi {
 
     /// 经指定出站请求 url 的耗时（毫秒）。对线路测的是“线路握手 + 请求”，对 exit 测的是整条链。
     pub fn delay(&self, outbound: &str, url: &str, timeout_ms: u32) -> Result<u64> {
-        let v = self.get(&format!("/proxies/{}/delay?timeout={timeout_ms}&url={}", enc(outbound), enc(url)))?;
+        let v = self.get(&format!("/proxies/{}/delay?timeout={timeout_ms}&url={}", enc(outbound), enc(&api_url(url))))?;
         v.get("delay").and_then(Value::as_u64).context("返回内容缺少 delay")
     }
 
     /// 让整组重新测速；urltest 组会据此立即重新选线。返回成功线路的延迟。
     pub fn group_delay(&self, group: &str, url: &str, timeout_ms: u32) -> Result<serde_json::Map<String, Value>> {
-        let v = self.get(&format!("/group/{}/delay?timeout={timeout_ms}&url={}", enc(group), enc(url)))?;
+        let v = self.get(&format!("/group/{}/delay?timeout={timeout_ms}&url={}", enc(group), enc(&api_url(url))))?;
         Ok(v.as_object().cloned().unwrap_or_default())
     }
 
     /// 线路组当前选中的线路。
     pub fn current_line(&self) -> Option<String> {
         self.get("/proxies/lines").ok()?.get("now")?.as_str().map(str::to_string)
+    }
+
+    /// 把 selector 组切到指定的出站。
+    pub fn select(&self, group: &str, name: &str) -> Result<()> {
+        let url = format!("{}/proxies/{}", self.base, enc(group));
+        let mut req = self.agent.request("PUT", &url).set("Content-Type", "application/json");
+        if !self.secret.is_empty() {
+            req = req.set("Authorization", &format!("Bearer {}", self.secret));
+        }
+        match req.send_string(&serde_json::json!({ "name": name }).to_string()) {
+            Ok(_) => Ok(()),
+            Err(ureq::Error::Status(code, r)) => bail!("Clash API 返回 {code}：{}", r.into_string().unwrap_or_default().trim()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// 此刻经指定入站的连接数（线路控制器据此决定探测得多勤）。
+    pub fn connections_on(&self, inbound: &str) -> Option<usize> {
+        let v = self.get("/connections").ok()?;
+        let suffix = format!("/{inbound}");
+        Some(v["connections"].as_array().map_or(0, |a| {
+            a.iter().filter(|c| c["metadata"]["type"].as_str().is_some_and(|t| t.ends_with(&suffix))).count()
+        }))
     }
 
     /// 当前 Clash 模式（出口锁定用 Lock / Open）。
@@ -252,6 +276,16 @@ impl ClashApi {
     }
 }
 
+/// 发给 Clash API 的测速地址。sing-box 会把 http:// 开头的地址换成它自己的默认地址（照顾面板的旧习惯），
+/// 但只认小写；实测（1.14）把协议名写成大写，就按原样用 HTTP 测。以后的版本要是连大写也换掉，
+/// 结果是改测它的默认 HTTPS 地址，探测仍然有效，只是不再是配置里写的那个地址。
+fn api_url(url: &str) -> String {
+    match url.strip_prefix("http://") {
+        Some(rest) => format!("HTTP://{rest}"),
+        None => url.to_string(),
+    }
+}
+
 fn enc(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -270,6 +304,12 @@ mod tests {
         assert!(same_ip("203.0.113.10", " 203.0.113.10\n"));
         assert!(same_ip("2001:db8::1", "2001:0db8:0:0:0:0:0:1"));
         assert!(!same_ip("203.0.113.10", "203.0.113.11"));
+    }
+
+    #[test]
+    fn http_probe_urls_are_sent_with_an_uppercase_scheme() {
+        assert_eq!(api_url("http://127.0.0.1:8080/204"), "HTTP://127.0.0.1:8080/204");
+        assert_eq!(api_url("https://www.gstatic.com/generate_204"), "https://www.gstatic.com/generate_204");
     }
 
     #[test]

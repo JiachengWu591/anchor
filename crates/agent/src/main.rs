@@ -4,8 +4,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
+mod disconnects;
 mod exitguard;
 mod guardpoll;
+mod health;
+mod lines;
 mod session;
 mod shared;
 mod tray;
@@ -104,6 +107,11 @@ fn real_main(args: Args) -> Result<()> {
         let sh = sh.clone();
         thread::spawn(move || guardpoll::run(sh));
     }
+    // 断联采集：实时读 sing-box 日志
+    let disconnect_thread = {
+        let sh = sh.clone();
+        thread::spawn(move || disconnects::run(sh))
+    };
     {
         let sh = sh.clone();
         thread::spawn(move || maintenance(sh));
@@ -121,6 +129,7 @@ fn real_main(args: Args) -> Result<()> {
     }
     sh.request_stop("托盘退出");
     let _ = sessions.join();
+    let _ = disconnect_thread.join();
     pipe_stop.store(true, Ordering::SeqCst);
     ipc::wake(&pipe);
     sh.tl.event("agent_stop", json!({ "reason": sh.stop_reason() }));

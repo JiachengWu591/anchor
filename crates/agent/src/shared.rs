@@ -1,13 +1,13 @@
 //! 用户代理各线程共享的状态。
 
-use anchor_core::config::Paths;
+use anchor_core::config::{Config, Paths};
 use anchor_core::exitlock::View as ExitView;
 use anchor_core::log;
 use anchor_core::timeline::Timeline;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Default)]
@@ -39,10 +39,12 @@ pub struct Status {
     pub kernel_restarts: u32,
     pub kernel_error: Option<String>,
     pub listen: String,
+    /// 现在用的出口的名字（主出口或 anchor exit use 选的备用出口）
+    pub exit_name: String,
     pub line: Option<String>,
     pub line_mode: String,
     pub lines: usize,
-    /// 当前线路（手动模式）或全部线路（自动模式）不可用
+    /// 当前线路（固定或手动模式）或全部线路（自动模式）不可用
     pub lines_down: bool,
     pub config_error: Option<String>,
     pub guard: GuardView,
@@ -77,6 +79,14 @@ pub struct Shared {
     pub net_gen: AtomicU64,
     /// 用户要求立即核对出口
     pub recheck: AtomicBool,
+    /// 当前会话使用的配置（断联突发探测要用）；配置有误、还没开始会话时为空
+    pub cfg: Mutex<Option<Arc<Config>>>,
+    /// anchor line use / pin / unpin：线路控制器线程取走处理，经通道回话
+    pub line_cmds: Mutex<Vec<(crate::lines::LineCmd, crate::lines::Reply)>>,
+    /// 刚记到一次断联：请线路控制器立刻测当前线路
+    pub line_kick: AtomicBool,
+    /// 各线路的评分（anchor line list）；没有配置线路、会话没在运行时为空
+    pub lines_view: Mutex<Option<serde_json::Value>>,
     st: Mutex<Status>,
     notes: Mutex<VecDeque<Note>>,
     stop_reason: Mutex<String>,
@@ -96,6 +106,10 @@ impl Shared {
             tray,
             net_gen: AtomicU64::new(0),
             recheck: AtomicBool::new(false),
+            cfg: Mutex::new(None),
+            line_cmds: Mutex::new(Vec::new()),
+            line_kick: AtomicBool::new(false),
+            lines_view: Mutex::new(None),
             st: Mutex::new(st),
             notes: Mutex::new(VecDeque::new()),
             stop_reason: Mutex::new(String::new()),
@@ -135,6 +149,10 @@ impl Shared {
                 q.pop_front();
             }
         }
+    }
+
+    pub fn config(&self) -> Option<Arc<Config>> {
+        self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     pub fn take_notes(&self) -> Vec<Note> {

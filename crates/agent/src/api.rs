@@ -2,7 +2,9 @@
 //!
 //! status：运行状态；reload：重新读取配置并重启内核；stop：退出；event：记录命令行发起的事件（目前只有 app_launch）；
 //! exit.recheck：先锁住 AI 通道，立即核对出口（与网络变化时的处理相同）。
+//! line.list：各线路的评分；line.use / line.pin / line.unpin：手动换线、固定、取消固定（交给线路控制器）。
 
+use crate::lines::LineCmd;
 use crate::shared::Shared;
 use anchor_core::ipc::{Request, Response};
 use anyhow::{Result, bail};
@@ -40,6 +42,10 @@ fn dispatch(sh: &Arc<Shared>, req: &Request) -> Result<Value> {
             sh.poke();
             Ok(json!({ "rechecking": true }))
         }
+        "line.list" => lines_view(sh),
+        "line.use" => line_cmd(sh, LineCmd::Use(name(req)?)),
+        "line.pin" => line_cmd(sh, LineCmd::Pin(name(req)?)),
+        "line.unpin" => line_cmd(sh, LineCmd::Unpin),
         "stop" => {
             sh.request_stop("命令行请求");
             crate::tray::wake();
@@ -57,5 +63,31 @@ fn dispatch(sh: &Arc<Shared>, req: &Request) -> Result<Value> {
             Ok(json!({ "recorded": true }))
         }
         m => bail!("未知方法 {m}"),
+    }
+}
+
+fn name(req: &Request) -> Result<String> {
+    match req.params["name"].as_str().map(str::trim) {
+        Some(n) if !n.is_empty() => Ok(n.to_string()),
+        _ => bail!("缺少线路名"),
+    }
+}
+
+fn lines_view(sh: &Shared) -> Result<Value> {
+    match sh.lines_view.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(v) => Ok(v),
+        None => bail!("没有配置线路（anchor.toml 里没有 [[lines]]），或者配置有误、内核还没运行"),
+    }
+}
+
+/// 交给线路控制器线程处理，等它回话（它每 0.2 秒看一次）。
+fn line_cmd(sh: &Shared, cmd: LineCmd) -> Result<Value> {
+    lines_view(sh)?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    sh.line_cmds.lock().unwrap_or_else(|e| e.into_inner()).push((cmd, tx));
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(Ok(msg)) => Ok(json!({ "message": msg, "lines": lines_view(sh).ok() })),
+        Ok(Err(e)) => bail!("{e}"),
+        Err(_) => bail!("线路控制器 5 秒内没有回应"),
     }
 }

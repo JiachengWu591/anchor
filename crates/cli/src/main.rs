@@ -6,7 +6,10 @@
 
 mod agentctl;
 mod check;
+mod exitcmd;
 mod launch;
+mod linecmd;
+mod report;
 mod sandbox;
 mod svcctl;
 mod timeline;
@@ -93,12 +96,28 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// 断联报告：断联次数、各段占比、“未知”占比，出口、线路、内核、网络的变化
+    Report {
+        /// 统计多久以内的，例如 24h、7d
+        #[arg(long, default_value = "7d")]
+        since: humantime::Duration,
+        /// 同时列出每一次断联
+        #[arg(long)]
+        list: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// 扫描本机已安装的 AI 程序
     Scan,
     /// 出口：核对与锁定
     Exit {
         #[command(subcommand)]
         action: ExitCmd,
+    },
+    /// 线路：看评分、手动换线、固定（换线不改变出口 IP）
+    Line {
+        #[command(subcommand)]
+        action: LineCmd,
     },
     /// 防火墙守卫：保证 AI 程序只能经 AI 通道联网
     Guard {
@@ -161,9 +180,33 @@ enum AgentCmd {
 }
 
 #[derive(Subcommand)]
+enum LineCmd {
+    /// 各线路最近 5 分钟的成功率、延迟中位数，当前用哪条
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// 手动换到这条线路（已建立的连接留在原线路上）
+    Use { name: String },
+    /// 固定在这条线路：不再自动换线，重启后仍然有效
+    Pin { name: String },
+    /// 取消固定
+    Unpin,
+}
+
+#[derive(Subcommand)]
 enum ExitCmd {
     /// 立即核对出口：先锁住 AI 通道，与基线一致后放行（和网络变化时一样）
     Check,
+    /// 列出主出口和备用出口、各自登记的基线，现在用的是哪个
+    List,
+    /// 切换到另一个出口（AI 服务看到的 IP 会改变）：先关闭正在运行的 AI 程序，切换后重新打开
+    Use {
+        name: String,
+        /// 不询问，直接关闭 AI 程序并切换
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +269,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Gen { .. }
             | Cmd::Up
             | Cmd::Baseline { .. }
+            | Cmd::Exit { action: ExitCmd::Use { .. } }
             | Cmd::Launch { .. }
             | Cmd::Browser { .. }
             | Cmd::Repair
@@ -263,6 +307,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         },
         Cmd::Up => up(&paths)?,
         Cmd::Status => status(&paths)?,
+        Cmd::Report { since, list, json } => report::run(&paths, since.into(), list, json)?,
         Cmd::Timeline { since, kind, probes, limit, json } => {
             timeline::print(&paths, &timeline::Query { since: since.into(), kinds: kind, probes, limit, json })?
         }
@@ -286,7 +331,17 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Baseline { yes } => baseline(&paths, yes)?,
         Cmd::Scan => scan(&paths),
         Cmd::Guard { action } => guard_cmd(&paths, action)?,
-        Cmd::Exit { action: ExitCmd::Check } => agentctl::exit_check()?,
+        Cmd::Exit { action } => match action {
+            ExitCmd::Check => agentctl::exit_check()?,
+            ExitCmd::List => exitcmd::list(&paths)?,
+            ExitCmd::Use { name, yes } => exitcmd::use_exit(&paths, &name, yes)?,
+        },
+        Cmd::Line { action } => match action {
+            LineCmd::List { json } => linecmd::list(json)?,
+            LineCmd::Use { name } => linecmd::use_line(&name)?,
+            LineCmd::Pin { name } => linecmd::pin(&name)?,
+            LineCmd::Unpin => linecmd::unpin()?,
+        },
         Cmd::Run { program, args } => return launch::run_cli(&Config::load(&paths)?, &program, &args),
         Cmd::Launch { app, pause_on_error } => {
             pause_if_err(pause_on_error, || launch::launch_desktop(&Config::load(&paths)?, &app))?
@@ -585,7 +640,7 @@ fn status(paths: &Paths) -> Result<()> {
 fn status_routes(cfg: &Config, up: bool) {
     println!("出口  {}；基线 IP {}", cfg.exit.label(), if cfg.expect.ip.is_empty() { "未登记" } else { &cfg.expect.ip });
     if !cfg.backup_exits.is_empty() {
-        println!("      备用出口 {} 个（P1b 起支持确认后切换）", cfg.backup_exits.len());
+        println!("      现在用的是 {}；共 {} 个出口（anchor exit list / anchor exit use <名称>）", cfg.exit_name(), cfg.exits.len());
     }
 
     if cfg.lines.is_empty() {
@@ -597,7 +652,7 @@ fn status_routes(cfg: &Config, up: bool) {
         };
         let api = net::ClashApi::new(&cfg);
         let current = if up { api.current_line() } else { None };
-        println!("线路  {} 条，{mode}；当前 {}", cfg.lines.len(), current.as_deref().unwrap_or("未知"));
+        println!("线路  {} 条，{mode}；当前 {}（评分和换线：anchor line list）", cfg.lines.len(), current.as_deref().unwrap_or("未知"));
         for l in &cfg.lines {
             let name = l.name.as_deref().unwrap_or_default();
             let last = if up {

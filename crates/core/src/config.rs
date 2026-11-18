@@ -33,6 +33,10 @@ impl Paths {
     pub fn bin_dir(&self) -> PathBuf { self.home.join("bin") }
     pub fn browser_profile(&self, name: &str) -> PathBuf { self.home.join("browser").join(name) }
     pub fn timeline_db(&self) -> PathBuf { self.home.join("timeline.db") }
+    /// anchor exit use 选用的备用出口名；用主出口时没有这个文件
+    pub fn active_exit(&self) -> PathBuf { self.home.join("exit.active") }
+    /// anchor line pin 固定的线路名（重启后仍然有效）
+    pub fn line_pin(&self) -> PathBuf { self.home.join("line.pin") }
     pub fn agent_log(&self) -> PathBuf { self.log_dir().join("agent.log") }
 }
 
@@ -41,6 +45,12 @@ impl Paths {
 pub struct Node {
     #[serde(default)]
     pub name: Option<String>,
+    /// 只对线路有意义：评分接近时优先用数字小的（例如按流量成本排）。不传给 sing-box。
+    #[serde(default)]
+    pub priority: Option<u32>,
+    /// 只对备用出口有意义：这个出口自己的基线（anchor baseline 在用它时填写）。主出口的基线在 [expect]。不传给 sing-box。
+    #[serde(default)]
+    pub expect: Option<Expect>,
     #[serde(flatten)]
     pub outbound: Map<String, Value>,
 }
@@ -72,7 +82,7 @@ impl Default for ProxyCfg {
     fn default() -> Self { Self { listen: "127.0.0.1".into(), port: 17890 } }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Expect { pub ip: String, pub language: String, pub timezone: String, pub country: String }
 impl Default for Expect {
@@ -160,6 +170,19 @@ impl Default for CoreCfg {
     }
 }
 
+/// 域名解析。只对 type = "direct" 的出口起作用：这种出口由 sing-box 在本机解析目标域名，
+/// 默认的“系统 DNS”可能取到别的网卡的 DNS，让 AI 域名的查询绕过 VPN、明文发到本地网络。
+/// 代理型出口（socks、shadowsocks……）把域名交给出口服务器解析，不经本机 DNS。
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DnsCfg {
+    /// 经出口发出的加密 DNS（DoH）服务器 IP。用 IP 免得为了找 DNS 服务器先查一次 DNS
+    pub exit_doh: String,
+}
+impl Default for DnsCfg {
+    fn default() -> Self { Self { exit_doh: "1.1.1.1".into() } }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CheckCfg { pub local_url: String, pub ip_info: String, pub ip_echo: Vec<String> }
@@ -197,30 +220,119 @@ pub struct Config {
     pub core: CoreCfg,
     #[serde(default)]
     pub check: CheckCfg,
+    #[serde(default)]
+    pub dns: DnsCfg,
+    /// 配置里的所有出口（主出口在前），以及现在用的是哪个。由 select_exit 填写
+    #[serde(skip)]
+    pub exits: Vec<ExitEntry>,
+    /// 现在用的是第几个备用出口（从 0 数）；用主出口时为 None
+    #[serde(skip)]
+    pub active_backup: Option<usize>,
 }
+
+/// anchor exit list 的一行。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitEntry {
+    pub name: String,
+    pub label: String,
+    /// 登记的基线 IP；还没登记时为空
+    pub baseline_ip: String,
+    pub active: bool,
+    pub primary: bool,
+}
+
+/// 主出口没写 name 时的称呼
+pub const MAIN_EXIT: &str = "main";
 
 /// sing-box 配置里由 AI Anchor 占用的出站名。
 const RESERVED: &[&str] = &["exit", "lines", "direct", "ai-in", "probe-in"];
 
 impl Config {
+    /// 读取配置，并按 anchor exit use 的选择决定用哪个出口。
     pub fn load(paths: &Paths) -> Result<Self> {
         let p = paths.config();
         let text = std::fs::read_to_string(&p)
             .with_context(|| format!("读取配置失败：{}（还没有配置？先运行 anchor init）", p.display()))?;
-        Self::parse(&text).with_context(|| format!("配置有误：{}", p.display()))
+        let mut cfg = Self::parse(&text).with_context(|| format!("配置有误：{}", p.display()))?;
+        if let Ok(want) = std::fs::read_to_string(paths.active_exit()) {
+            cfg.select_exit(Some(want.trim()))?;
+        }
+        Ok(cfg)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
         // 记事本“UTF-8 带 BOM”、PowerShell 5 的 Set-Content -Encoding utf8 都会在开头写 BOM
-        let cfg: Config = toml::from_str(text.trim_start_matches('\u{feff}'))?;
+        let mut cfg: Config = toml::from_str(text.trim_start_matches('\u{feff}'))?;
         cfg.validate()?;
+        cfg.select_exit(None)?;
         Ok(cfg)
+    }
+
+    /// 主出口的名字（没写 name 时叫 main）
+    pub fn main_exit_name(&self) -> String {
+        match self.active_backup {
+            None => self.exit.name.clone(),
+            Some(_) => self.exits.first().map(|e| e.name.clone()),
+        }
+        .filter(|n| !n.trim().is_empty())
+        .unwrap_or_else(|| MAIN_EXIT.to_string())
+    }
+
+    /// 现在用的出口的名字
+    pub fn exit_name(&self) -> String {
+        self.exits.iter().find(|e| e.active).map(|e| e.name.clone()).unwrap_or_else(|| MAIN_EXIT.to_string())
+    }
+
+    /// 选用名为 want 的出口（None、空或主出口的名字：用主出口）。选了备用出口后，exit 和 expect
+    /// 就是它的出站和它自己的基线，其余代码不用区分。只能在刚解析完的配置上调用。
+    pub fn select_exit(&mut self, want: Option<&str>) -> Result<()> {
+        let main = self.main_exit_name();
+        let want = want.map(str::trim).filter(|w| !w.is_empty() && *w != main);
+        let mut entries = vec![ExitEntry {
+            name: main,
+            label: self.exit.label(),
+            baseline_ip: self.expect.ip.trim().to_string(),
+            active: want.is_none(),
+            primary: true,
+        }];
+        for b in &self.backup_exits {
+            let name = b.name.clone().unwrap_or_default();
+            entries.push(ExitEntry {
+                active: want == Some(name.as_str()),
+                label: b.label(),
+                baseline_ip: b.expect.as_ref().map(|e| e.ip.trim().to_string()).unwrap_or_default(),
+                primary: false,
+                name,
+            });
+        }
+        if let Some(w) = want {
+            let Some(i) = self.backup_exits.iter().position(|b| b.name.as_deref() == Some(w)) else {
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                bail!("现在选用的出口 {w} 不在 anchor.toml 里（有：{}）。运行 anchor exit use <名称> 重新选一个", names.join("、"));
+            };
+            let b = self.backup_exits[i].clone();
+            // 语言跟主出口一致，除非这个出口自己写了
+            self.expect = b.expect.clone().unwrap_or_else(|| Expect { language: self.expect.language.clone(), ..Expect::default() });
+            self.exit = Node { expect: None, ..b };
+            self.active_backup = Some(i);
+        }
+        self.exits = entries;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
         check_node("[exit]", &self.exit)?;
+        let main = self.exit.name.as_deref().map(str::trim).filter(|n| !n.is_empty()).unwrap_or(MAIN_EXIT);
+        let mut exit_names = HashSet::from([main.to_string()]);
         for (i, b) in self.backup_exits.iter().enumerate() {
             check_node(&format!("第 {} 个备用出口", i + 1), b)?;
+            let name = b.name.as_deref().unwrap_or("").trim();
+            if name.is_empty() {
+                bail!("第 {} 个备用出口缺少 name（anchor exit use 按名字选出口）", i + 1);
+            }
+            if !exit_names.insert(name.to_string()) {
+                bail!("出口名重复：{name}");
+            }
         }
         let mut seen = HashSet::new();
         for (i, l) in self.lines.iter().enumerate() {
@@ -243,9 +355,13 @@ impl Config {
         if ai == api || ai == probe || api == probe {
             bail!("AI 代理端口 {ai}、Clash API 端口 {api}、探测端口 {probe} 不能相同（[proxy] port、[core] api_port、[core] probe_port）");
         }
-        // sing-box 的测速接口（Clash API delay）遇到 http:// 地址会忽略它，改测默认地址，结果就不可信了
-        if !self.switch.probe_url.trim().starts_with("https://") {
-            bail!("[switch] probe_url 必须是 https:// 地址（sing-box 测速会忽略 http:// 地址）：{}", self.switch.probe_url);
+        // http:// 也可以（省掉 TLS 握手）：发给内核时由 net::ClashApi 处理它对 http:// 的特殊对待
+        let probe = self.switch.probe_url.trim();
+        if !(probe.starts_with("https://") || probe.starts_with("http://")) {
+            bail!("[switch] probe_url 必须是 http:// 或 https:// 地址：{}", self.switch.probe_url);
+        }
+        if self.dns.exit_doh.trim().parse::<std::net::IpAddr>().is_err() {
+            bail!("[dns] exit_doh 必须是 IP 地址（例如 \"1.1.1.1\"）：{}", self.dns.exit_doh);
         }
         let e = self.switch.exit_check_interval.trim();
         humantime::parse_duration(e).with_context(|| format!("[switch] exit_check_interval 格式错误：{e}（例如 \"60s\"）"))?;
@@ -315,17 +431,47 @@ pub fn host_port(host: &str, port: u16) -> String {
     if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") }
 }
 
-/// 把测得的出口信息写回 [expect]，保留文件里的注释和格式。
+/// 把测得的出口信息登记为现在所用出口的基线，保留文件里的注释和格式。
+/// 用主出口时写 [expect]；用备用出口时写它那一项 [[backup_exits]] 里的 expect。
 pub fn set_expect(paths: &Paths, info: &ExitInfo) -> Result<()> {
+    let active_backup = Config::load(paths)?.active_backup;
     let p = paths.config();
     let text = std::fs::read_to_string(&p)?;
     let mut doc: toml_edit::DocumentMut = text.trim_start_matches('\u{feff}').parse().context("解析 anchor.toml 失败")?;
-    doc["expect"]["ip"] = toml_edit::value(info.ip.clone());
+    let mut fields = vec![("ip", info.ip.clone())];
     if let Some(tz) = &info.timezone {
-        doc["expect"]["timezone"] = toml_edit::value(tz.clone());
+        fields.push(("timezone", tz.clone()));
     }
     if let Some(c) = &info.country {
-        doc["expect"]["country"] = toml_edit::value(c.clone());
+        fields.push(("country", c.clone()));
+    }
+    match active_backup {
+        None => {
+            for (k, v) in fields {
+                doc["expect"][k] = toml_edit::value(v);
+            }
+        }
+        Some(i) => {
+            let table = doc
+                .get_mut("backup_exits")
+                .and_then(|x| x.as_array_of_tables_mut())
+                .and_then(|a| a.get_mut(i))
+                .context("anchor.toml 里的备用出口要写成 [[backup_exits]] 的形式，才能登记它的基线")?;
+            match table.get_mut("expect").and_then(|e| e.as_table_like_mut()) {
+                Some(t) => {
+                    for (k, v) in fields {
+                        t.insert(k, toml_edit::value(v));
+                    }
+                }
+                None => {
+                    let mut t = toml_edit::InlineTable::new();
+                    for (k, v) in fields {
+                        t.insert(k, v.into());
+                    }
+                    table.insert("expect", toml_edit::Item::Value(toml_edit::Value::InlineTable(t)));
+                }
+            }
+        }
     }
     std::fs::write(&p, doc.to_string())?;
     Ok(())
@@ -360,6 +506,8 @@ version = "5"
 # 如果本机 VPN 本身就能稳定出境，可以不写线路，少一层故障点。
 [[lines]]
 name = "line-a"
+# 评分接近时优先用数字小的线路（例如按流量成本排）；不写的排在写了的后面
+# priority = 1
 type = "shadowsocks"
 server = "198.51.100.20"
 server_port = 8388
@@ -375,7 +523,8 @@ password = "AAAAAAAAAAAAAAAAAAAAAA=="
 # password = "请替换"
 # tls = { enabled = true, server_name = "line-b.example.com" }
 
-# 备用出口：P0 只做记录，P1 起在用户确认后从下一次会话开始启用。
+# 备用出口：只在你运行 anchor exit use <名称> 时启用，不会自动切换（换出口就是换 IP）。
+# 每个出口有自己的基线：切过去后运行 anchor baseline，会登记在这一项的 expect 里。
 # [[backup_exits]]
 # name = "backup"
 # type = "socks"
@@ -390,12 +539,13 @@ timezone = ""
 country = ""
 
 [switch]
-lines = "auto"               # auto：线路自动切换；manual：固定用第一条
+lines = "auto"               # auto：线路控制器按规则换线；manual：不自动换，用 anchor line use 手动换
 keep_existing_conns = true   # 切换线路时不打断已建立的连接
+# 测速地址：线路探测和整条链路探测都请求它。http:// 地址也可以（省掉 TLS 握手）
 probe_url = "https://www.gstatic.com/generate_204"
-probe_interval = "30s"
-tolerance_ms = 50
-# 线路看门狗：每隔这么久探测当前线路，失败时立即重新选线，不必等 probe_interval。"0s" 关闭
+probe_interval = "30s"       # 当前线路以外的线路多久探测一次
+tolerance_ms = 50            # 只在前台调试的 anchor up 里起作用（urltest 的容差）
+# 当前线路的探测间隔（有 AI 连接时；空闲时 15 秒一次）。探测失败就立刻把所有线路测一遍并换线。"0s" 关闭定时探测
 watch_interval = "3s"
 # 出口 IP 定时核对（至少 5 秒）。网络变化、内核启动时会先锁住 AI 通道并立即核对，与基线一致才放行
 exit_check_interval = "60s"
@@ -419,6 +569,11 @@ allow_fakeip = false
 fakeip_range = "198.18.0.0/15"
 # 额外需要守卫的程序完整路径，例如 'C:\Tools\some-ai-cli.exe'
 extra_programs = []
+
+[dns]
+# 只对 type = "direct" 的出口起作用：目标域名经出口用加密 DNS（DoH）解析，查询不经本地网络。
+# 代理型出口（socks、shadowsocks……）由出口服务器解析域名，不受这项影响。
+exit_doh = "1.1.1.1"
 
 [core]
 # sing-box.exe 路径；留空时依次查找 <数据目录>\bin、anchor.exe 同目录、PATH。
@@ -494,6 +649,75 @@ mod tests {
         std::fs::remove_dir_all(home).unwrap();
     }
 
+    const WITH_BACKUPS: &str = "[exit]\nname = \"home\"\ntype = \"socks\"\nserver = \"203.0.113.10\"\nserver_port = 1080\n\n\
+        [expect]\nip = \"203.0.113.10\"\nlanguage = \"en-GB\"\n\n\
+        # 第一个备用\n[[backup_exits]]\nname = \"b1\"\ntype = \"socks\"\nserver = \"203.0.113.11\"\nserver_port = 1080\n\n\
+        [[backup_exits]]\nname = \"b2\"\ntype = \"socks\"\nserver = \"203.0.113.12\"\nserver_port = 1080\nexpect = { ip = \"203.0.113.12\" }\n";
+
+    #[test]
+    fn backup_exit_is_used_only_when_selected_and_has_its_own_baseline() {
+        let cfg = Config::parse(WITH_BACKUPS).unwrap();
+        assert_eq!((cfg.exit_name().as_str(), cfg.active_backup), ("home", None));
+        assert_eq!(cfg.exits.iter().map(|e| (e.name.as_str(), e.baseline_ip.as_str(), e.active)).collect::<Vec<_>>(), [
+            ("home", "203.0.113.10", true),
+            ("b1", "", false),
+            ("b2", "203.0.113.12", false),
+        ]);
+
+        let mut b2 = Config::parse(WITH_BACKUPS).unwrap();
+        b2.select_exit(Some("b2")).unwrap();
+        assert_eq!(b2.exit.server(), Some("203.0.113.12"));
+        assert_eq!(b2.expect.ip, "203.0.113.12", "按这个出口自己的基线核对");
+        assert_eq!((b2.exit_name().as_str(), b2.main_exit_name().as_str(), b2.active_backup), ("b2", "home", Some(1)));
+        assert!(b2.exit.expect.is_none() && !b2.exit.outbound.contains_key("expect"), "expect 不传给内核");
+
+        // 还没登记基线的备用出口：基线为空（AI 通道保持锁住，直到 anchor baseline），语言沿用主出口
+        let mut b1 = Config::parse(WITH_BACKUPS).unwrap();
+        b1.select_exit(Some("b1")).unwrap();
+        assert_eq!((b1.expect.ip.as_str(), b1.expect.language.as_str()), ("", "en-GB"));
+
+        // 选主出口的名字、空：都是主出口；选不存在的：报错，不悄悄换回主出口
+        let mut main = Config::parse(WITH_BACKUPS).unwrap();
+        main.select_exit(Some("home")).unwrap();
+        assert_eq!(main.active_backup, None);
+        assert!(Config::parse(WITH_BACKUPS).unwrap().select_exit(Some("gone")).is_err());
+    }
+
+    #[test]
+    fn backup_exits_need_unique_names() {
+        let unnamed = format!("{MIN}[[backup_exits]]\ntype = \"socks\"\n");
+        assert!(Config::parse(&unnamed).is_err());
+        let dup = format!("{MIN}[[backup_exits]]\nname = \"main\"\ntype = \"socks\"\n");
+        assert!(Config::parse(&dup).is_err(), "和主出口（没写名字时叫 main）重名");
+    }
+
+    #[test]
+    fn baseline_is_registered_on_the_exit_in_use() {
+        let home = std::env::temp_dir().join(format!("anchor-test-{}", crate::util::random_hex()));
+        std::fs::create_dir_all(&home).unwrap();
+        let paths = Paths { home: home.clone() };
+        std::fs::write(paths.config(), WITH_BACKUPS).unwrap();
+        std::fs::write(paths.active_exit(), "b1\n").unwrap();
+        let info = |ip: &str| ExitInfo { ip: ip.into(), country: Some("JP".into()), region: None, city: None, timezone: None, org: None, source: "test".into() };
+        set_expect(&paths, &info("198.51.100.5")).unwrap();
+        let text = std::fs::read_to_string(paths.config()).unwrap();
+        assert!(text.contains("# 第一个备用"), "注释保留");
+        let cfg = Config::load(&paths).unwrap();
+        assert_eq!((cfg.exit_name().as_str(), cfg.expect.ip.as_str(), cfg.expect.country.as_str()), ("b1", "198.51.100.5", "JP"));
+        assert_eq!(cfg.exits[0].baseline_ip, "203.0.113.10", "主出口的基线没动");
+        assert_eq!(cfg.exits[2].baseline_ip, "203.0.113.12", "另一个备用出口的基线没动");
+        // 已经有 expect 的那一项：改它里面的字段
+        std::fs::write(paths.active_exit(), "b2").unwrap();
+        set_expect(&paths, &info("198.51.100.6")).unwrap();
+        assert_eq!(Config::load(&paths).unwrap().expect.ip, "198.51.100.6");
+        // 回到主出口：写 [expect]
+        std::fs::remove_file(paths.active_exit()).unwrap();
+        set_expect(&paths, &info("198.51.100.7")).unwrap();
+        let cfg = Config::load(&paths).unwrap();
+        assert_eq!((cfg.expect.ip.as_str(), cfg.exits[1].baseline_ip.as_str()), ("198.51.100.7", "198.51.100.5"));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
     #[test]
     fn watch_interval_parsing() {
         let cfg = Config::parse(MIN).unwrap();
@@ -519,7 +743,10 @@ mod tests {
         assert_ne!(cfg.probe_auth().1, other.probe_auth().1, "密码随 api_secret 变化");
         assert!(Config::parse(&format!("{MIN}[core]\nprobe_port = 17890\n")).is_err(), "与 AI 端口冲突");
         assert!(Config::parse(&format!("{MIN}[switch]\nexit_check_interval = \"soon\"\n")).is_err());
-        assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"http://x/204\"\n")).is_err(), "测速地址必须是 https");
+        assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"http://x/204\"\n")).is_ok(), "http 测速地址也可以");
+        assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"x/204\"\n")).is_err(), "测速地址要带协议");
+        assert!(Config::parse(&format!("{MIN}[dns]\nexit_doh = \"dns.google\"\n")).is_err(), "DoH 服务器要写 IP");
+        assert_eq!(Config::parse(MIN).unwrap().dns.exit_doh, "1.1.1.1");
     }
 
     #[test]

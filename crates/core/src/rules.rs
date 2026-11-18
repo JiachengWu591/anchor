@@ -22,6 +22,27 @@ pub const AI_DOMAINS: &[&str] = &[
     "cursor.sh",
 ];
 
+/// 是否 AI 服务自有的域名（本身或子域名）。断联只统计这些：AI 程序也会访问别的网站，那些站点出错不算通道的问题。
+pub fn is_ai_domain(host: &str) -> bool {
+    let h = host.trim().trim_end_matches('.').to_ascii_lowercase();
+    AI_DOMAINS.iter().any(|d| h == *d || h.ends_with(&format!(".{d}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ai_domain_matching() {
+        assert!(is_ai_domain("claude.ai"));
+        assert!(is_ai_domain("API.Anthropic.com."));
+        assert!(is_ai_domain("bridge.claudeusercontent.com"));
+        assert!(!is_ai_domain("notclaude.ai"), "后缀要按标签匹配");
+        assert!(!is_ai_domain("http-intake.logs.us5.datadoghq.com"));
+        assert!(!is_ai_domain("api.github.com"));
+    }
+}
+
 pub fn print(format: &str) -> Result<()> {
     match format {
         "singbox" => println!(

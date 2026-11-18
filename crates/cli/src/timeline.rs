@@ -61,11 +61,15 @@ pub fn print(paths: &Paths, q: &Query) -> Result<()> {
 
 fn segment(s: &str) -> &str {
     match s {
-        "line" => "线路",
-        "local" => "本地网络",
+        "line" => "当前线路",
+        "line_other" => "其他线路",
+        "lan" => "路由器",
+        "wan" => "绕开 VPN 上网",
+        "local" => "本机上网",
         "chain" => "整条链路",
-        "exit" => "出口",
+        "exit" => "出口核对",
         "ai" => "AI 服务",
+        "status" => "官方状态页",
         other => other,
     }
 }

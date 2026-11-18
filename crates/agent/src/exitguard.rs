@@ -17,8 +17,11 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-/// 回显服务一次请求的超时；出口本身通不通的测试超时。
-const ECHO_TIMEOUT: Duration = Duration::from_secs(4);
+/// 回显服务一次请求的超时：锁着时短（有并发核对兜底，要尽快放行），放行时长（不急，宁可等）。
+/// 实测：经 VPN 的新连接偶尔要 3～5 秒才完成 TLS 握手；放行时用 4 秒，约五分之一的定时核对会超时。
+const ECHO_TIMEOUT_LOCKED: Duration = Duration::from_secs(4);
+const ECHO_TIMEOUT_OPEN: Duration = Duration::from_secs(8);
+/// 出口本身通不通的测试超时。
 const EXIT_PROBE_TIMEOUT_MS: u32 = 3000;
 /// 一次网络变化通常带来一串通知（地址、路由先删后加）：最后一条之后静默这么久再核对，
 /// 免得在隧道切换到一半时核对，也免得反复丢弃进行中的核对。
@@ -31,6 +34,8 @@ const EXIT_PROBE_GRACE: Duration = Duration::from_secs(1);
 /// 只跑一个的话，卡住的那个会把下一次尝试推迟到隧道早已可用之后。
 const HEDGE_AFTER: Duration = Duration::from_secs(1);
 const MAX_INFLIGHT: usize = 3;
+/// net_change 事件最少间隔（一次 VPN 重连会带来好几串通知）
+const NET_EVENT_EVERY: Duration = Duration::from_secs(5);
 
 /// 核对用的来源：纯 IP 回显服务在前（高频核对用它们），带地理信息的服务在后。
 pub fn sources(cfg: &Config) -> Vec<String> {
@@ -44,7 +49,12 @@ pub fn sources(cfg: &Config) -> Vec<String> {
 pub fn spawn(sh: Arc<Shared>, cfg: &Config, stop: Arc<AtomicBool>, kernel_gen: Arc<AtomicU64>) -> JoinHandle<()> {
     let ctx = Ctx {
         api: Arc::new(ClashApi::new(cfg)),
-        probe: net::agent_via_probe(cfg, ECHO_TIMEOUT).ok().map(Arc::new),
+        probe: (|| {
+            Some(Arc::new(Probes {
+                locked: net::agent_via_probe(cfg, ECHO_TIMEOUT_LOCKED).ok()?,
+                open: net::agent_via_probe(cfg, ECHO_TIMEOUT_OPEN).ok()?,
+            }))
+        })(),
         probe_url: cfg.switch.probe_url.clone(),
         sources: sources(cfg),
         baseline: cfg.expect.ip.trim().to_string(),
@@ -53,9 +63,15 @@ pub fn spawn(sh: Arc<Shared>, cfg: &Config, stop: Arc<AtomicBool>, kernel_gen: A
     thread::spawn(move || run(&sh, &ctx, &stop, &kernel_gen))
 }
 
+/// 经探测入站请求回显服务的客户端：锁着时用 locked，放行时用 open（超时不同）。
+struct Probes {
+    locked: ureq::Agent,
+    open: ureq::Agent,
+}
+
 struct Ctx {
     api: Arc<ClashApi>,
-    probe: Option<Arc<ureq::Agent>>,
+    probe: Option<Arc<Probes>>,
     probe_url: String,
     sources: Vec<String>,
     baseline: String,
@@ -104,6 +120,8 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
     let mut last_err = String::new();
     let mut inflight: Vec<Inflight> = Vec::new();
     let mut settle_until = Instant::now();
+    // 网络变化事件写进时间线（断联归因用），一串通知只记一条
+    let mut last_net_event: Option<Instant> = None;
 
     // 每次触发都丢掉进行中的核对：它走的可能是旧路径，等它超时只会拖慢放行
     while !stop.load(Ordering::SeqCst) {
@@ -124,6 +142,10 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
             seen_net = ng;
             inflight.clear();
             settle_until = now + NET_SETTLE;
+            if last_net_event.is_none_or(|t| now.duration_since(t) >= NET_EVENT_EVERY) {
+                sh.tl.event("net_change", serde_json::json!({}));
+                last_net_event = Some(now);
+            }
             apply(sh, m.trigger(now, Trigger::NetworkChange), &mut locked);
         }
         if sh.recheck.swap(false, Ordering::SeqCst) {
@@ -169,6 +191,8 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
                 if m.state().locked() || check != Check::Match {
                     log::line(&format!("出口核对：{} → {}（{} ms）", ctx.sources[f.source], describe(&check), took.as_millis()));
                 }
+                let note = if check == Check::Match { String::new() } else { describe(&check) };
+                sh.tl.probe("exit", &ctx.sources[f.source], check == Check::Match, Some(took.as_millis() as u64), &note);
                 let before = m.state();
                 apply(sh, m.on_check(Instant::now(), f.source, check), &mut locked);
                 // 状态变了（放行、确认已变化……）：其余并发的核对是按旧状态发起的，
@@ -200,7 +224,7 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
 fn start_check(
     sh: &Arc<Shared>,
     ctx: &Ctx,
-    probe: Arc<ureq::Agent>,
+    probe: Arc<Probes>,
     source: usize,
     locked: bool,
     kernel_gen: u64,
@@ -223,7 +247,8 @@ fn start_check(
             });
             prx
         });
-        let check = match net::get(&probe, &url) {
+        let agent = if locked { &probe.locked } else { &probe.open };
+        let check = match net::get(agent, &url) {
             // 拿到了响应：出口肯定通，只是回显服务出了问题（状态码、内容不对）
             Ok(r) => match net::parse_echo(&r) {
                 Ok(ip) => exitlock::classify(&baseline, &ip),
@@ -233,7 +258,15 @@ fn start_check(
             Err(e) => {
                 let exit_up = match parallel {
                     Some(rx) => rx.recv_timeout(EXIT_PROBE_GRACE).unwrap_or(false),
-                    None => exit_probe(api, probe_url)(),
+                    // 放行时判定“出口不可达”会立刻锁住 AI 通道：试两次，两次都失败才算，
+                    // 免得一次慢握手就把正常的通道锁上（DNS 修复前实测有过这种误锁）
+                    None => {
+                        let probe = exit_probe(api, probe_url);
+                        probe() || {
+                            thread::sleep(Duration::from_millis(500));
+                            probe()
+                        }
+                    }
                 };
                 Check::Failed { exit_up, reason: format!("{e:#}") }
             }

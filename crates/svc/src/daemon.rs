@@ -1,6 +1,7 @@
 //! 守卫维护：让防火墙守卫规则始终覆盖当前安装的 AI 程序版本。
 //!
-//! 触发：服务启动时、HKLM 应用包仓库变化时（应用安装或更新）、每 5 分钟轮询、收到 guard.refresh 请求时。
+//! 触发：服务启动时、HKLM 应用包仓库变化时（应用安装或更新，之后 15 秒、45 秒、2 分钟各补扫一次）、
+//! 每 5 分钟轮询、收到 guard.refresh 请求时。
 //! 要守卫的程序由服务自己按登记用户的配置文件目录和本机包仓库查找，不执行任何来自配置的路径；
 //! 用户配置只用来决定守卫哪些程序（[apps]、[guard]），配置有误时沿用上一次有效的配置。
 
@@ -20,6 +21,35 @@ use std::time::{Duration, Instant, SystemTime};
 
 const MAX_CHANGES: usize = 50;
 const MAX_PAUSE_MIN: u64 = 24 * 60;
+
+/// 应用包仓库变化后，再补扫几次（相对变化时刻）。
+/// 安装器常常先登记包、后解压文件，变化通知到达时新版本的程序文件可能还没到位。
+/// 实测（Claude 5.11492.5.0）：文件落地时的那次刷新没找到新版本，又把定时检查推后了 5 分钟，
+/// 结果 5 分 23 秒后才纳入守卫。
+const FOLLOWUPS: [Duration; 3] = [Duration::from_secs(15), Duration::from_secs(45), Duration::from_secs(120)];
+
+/// 待做的补扫时间点。
+#[derive(Default)]
+struct Followups {
+    at: VecDeque<Instant>,
+}
+
+impl Followups {
+    /// 又有变化：从这次变化重新排补扫。
+    fn schedule(&mut self, now: Instant) {
+        self.at = FOLLOWUPS.iter().map(|d| now + *d).collect();
+    }
+
+    /// 到点了就返回 true；同时到点的几次（刷新本身耗时较长时）只算一次。
+    fn take_due(&mut self, now: Instant) -> bool {
+        let mut due = false;
+        while self.at.front().is_some_and(|t| *t <= now) {
+            self.at.pop_front();
+            due = true;
+        }
+        due
+    }
+}
 
 pub struct Ctx {
     /// 安装时登记的用户
@@ -305,6 +335,7 @@ pub fn run(ctx: Ctx, stop: Arc<AtomicBool>, pipe_sddl: &str) -> Result<()> {
     // 服务启动：之前若处于暂停（暂停不跨重启），refresh 会把停用的规则恢复
     refresh_logged(&daemon, "服务启动");
     let mut next_poll = Instant::now() + poll;
+    let mut followups = Followups::default();
     while !stop.load(Ordering::SeqCst) {
         let expired = daemon.state().paused_until.is_some_and(|t| t <= SystemTime::now());
         if expired && let Err(e) = daemon.resume("暂停到期") {
@@ -325,8 +356,14 @@ pub fn run(ctx: Ctx, stop: Arc<AtomicBool>, pipe_sddl: &str) -> Result<()> {
                     w.wait(Duration::from_millis(500));
                 }
             }
-            refresh_logged(&daemon, "应用安装或更新");
+            let report = refresh_logged(&daemon, "应用安装或更新");
+            if report.is_some_and(|r| r.added.is_empty() && r.removed.is_empty()) {
+                log::line("应用包仓库有变化，守卫规则暂时不用改；15 秒、45 秒、2 分钟后再补扫");
+            }
+            followups.schedule(Instant::now());
             next_poll = Instant::now() + poll;
+        } else if followups.take_due(Instant::now()) {
+            refresh_logged(&daemon, "应用安装或更新（补扫）");
         } else if Instant::now() >= next_poll {
             refresh_logged(&daemon, "定时检查");
             next_poll = Instant::now() + poll;
@@ -337,8 +374,41 @@ pub fn run(ctx: Ctx, stop: Arc<AtomicBool>, pipe_sddl: &str) -> Result<()> {
     Ok(())
 }
 
-fn refresh_logged(d: &Daemon, source: &str) {
-    if let Err(e) = d.refresh(source, false) {
-        log::line(&format!("守卫刷新失败（{source}）：{e:#}"));
+fn refresh_logged(d: &Daemon, source: &str) -> Option<Report> {
+    match d.refresh(source, false) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            log::line(&format!("守卫刷新失败（{source}）：{e:#}"));
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn followups_after_a_package_change() {
+        let t0 = Instant::now();
+        let mut f = Followups::default();
+        assert!(!f.take_due(t0 + Duration::from_secs(600)), "没有变化就没有补扫");
+
+        f.schedule(t0);
+        assert!(!f.take_due(t0 + Duration::from_secs(14)));
+        assert!(f.take_due(t0 + Duration::from_secs(15)));
+        assert!(!f.take_due(t0 + Duration::from_secs(16)), "同一个时间点只扫一次");
+        assert!(f.take_due(t0 + Duration::from_secs(45)));
+        // 刷新卡了很久：错过的几次合并成一次
+        assert!(f.take_due(t0 + Duration::from_secs(300)));
+        assert!(!f.take_due(t0 + Duration::from_secs(301)));
+
+        // 补扫期间又有变化：从新的变化重新排
+        f.schedule(t0);
+        let t1 = t0 + Duration::from_secs(20);
+        f.take_due(t1);
+        f.schedule(t1);
+        assert!(!f.take_due(t1 + Duration::from_secs(14)));
+        assert!(f.take_due(t1 + Duration::from_secs(15)));
     }
 }

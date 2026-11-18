@@ -2,6 +2,8 @@
 //!
 //! 结构：本机 mixed 入站 → exit（固定出口）→ detour 到 lines 组（urltest/selector）→ 各条线路。
 //! 线路组切换只影响线路层，出口始终是同一个出站，所以 AI 服务看到的 IP 不变。
+//! 用户代理守护内核时线路组一律是 selector，选线由线路控制器（linectl）决定；
+//! 前台调试的 anchor up 没有控制器，自动模式仍用 urltest。
 //!
 //! 出口锁定（exit_lock）：AI 入站在 Clash 模式为 Lock 时拒绝新连接，内核以 Lock 模式启动，
 //! 由用户代理核对出口 IP 与基线一致后经 Clash API 切到 Open。探测入站（带认证）不受锁定影响，
@@ -16,6 +18,8 @@ pub const TAG_PROBE: &str = "probe-in";
 pub const TAG_EXIT: &str = "exit";
 pub const TAG_LINES: &str = "lines";
 pub const TAG_DIRECT: &str = "direct";
+/// direct 出口专用的 DNS：经出口发出的 DoH
+pub const TAG_EXIT_DNS: &str = "exit-dns";
 /// Clash 模式：AI 入站拒绝新连接
 pub const MODE_LOCK: &str = "Lock";
 /// Clash 模式：AI 入站放行
@@ -31,6 +35,14 @@ pub fn generate(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<Value> {
     if !cfg.lines.is_empty() {
         exit.insert("detour".into(), json!(TAG_LINES));
     }
+    // direct 出口由内核自己解析目标域名。默认的“本机 DNS”会取到别的网卡的 DNS：
+    // 实测开着全量 VPN 时，AI 域名的查询明文经 WLAN 发到了国内的公共 DNS，绕过 VPN，
+    // 还有约 15% 的 AI 连接因 DNS 超时失败。改为经出口本身发出的 DoH。
+    // 代理型出口把域名交给出口服务器解析，不需要。用户自己写了 domain_resolver 就照用。
+    let exit_dns = is_direct_exit(cfg) && !exit.contains_key("domain_resolver");
+    if exit_dns {
+        exit.insert("domain_resolver".into(), json!({ "server": TAG_EXIT_DNS, "strategy": "prefer_ipv4" }));
+    }
     outbounds.push(Value::Object(exit));
 
     if !cfg.lines.is_empty() {
@@ -38,7 +50,7 @@ pub fn generate(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<Value> {
         // keep_existing_conns：线路切换时不打断已有连接，回答到一半不会断。
         let interrupt = !cfg.switch.keep_existing_conns;
         outbounds.push(match cfg.switch.lines {
-            LineMode::Auto => json!({
+            LineMode::Auto if !exit_lock => json!({
                 "type": "urltest",
                 "tag": TAG_LINES,
                 "outbounds": names,
@@ -47,7 +59,7 @@ pub fn generate(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<Value> {
                 "tolerance": cfg.switch.tolerance_ms,
                 "interrupt_exist_connections": interrupt,
             }),
-            LineMode::Manual => json!({
+            _ => json!({
                 "type": "selector",
                 "tag": TAG_LINES,
                 "outbounds": names,
@@ -81,17 +93,20 @@ pub fn generate(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<Value> {
         clash_api["default_mode"] = json!(MODE_LOCK);
     }
 
-    Ok(json!({
+    // local：解析线路和出口服务器自己的域名（要靠它们才能连到出口，只能在本机解析）。
+    // exit-dns：direct 出口解析 AI 程序要访问的域名，经出口发出、加密。
+    let mut dns_servers = vec![json!({ "type": "local", "tag": "local" })];
+    if exit_dns {
+        dns_servers.push(json!({ "type": "https", "tag": TAG_EXIT_DNS, "server": cfg.dns.exit_doh.trim(), "detour": TAG_EXIT }));
+    }
+
+    let root = json!({
         "log": {
             "level": cfg.core.log_level,
             "timestamp": true,
             "output": log_file.to_string_lossy(),
         },
-        "dns": {
-            // 只用于解析线路服务器的域名；AI 程序走 HTTP CONNECT，目标域名交给出口解析。
-            "servers": [ { "type": "local", "tag": "local" } ],
-            "final": "local",
-        },
+        "dns": { "servers": dns_servers, "final": "local" },
         "inbounds": [
             {
                 "type": "mixed",
@@ -116,7 +131,13 @@ pub fn generate(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<Value> {
         },
         // 不开 cache_file：它会记住上次的 Clash 模式，内核重启后就不再以 Lock 启动。
         "experimental": { "clash_api": clash_api },
-    }))
+    });
+    Ok(root)
+}
+
+/// 出口是否 direct：由内核自己解析目标域名、直接连目标。
+pub fn is_direct_exit(cfg: &Config) -> bool {
+    cfg.exit.kind() == Some("direct")
 }
 
 #[cfg(test)]
@@ -172,6 +193,14 @@ mod tests {
     }
 
     #[test]
+    fn under_the_agent_the_line_group_is_always_a_selector() {
+        let v = build_with(TWO_LINES, true);
+        let g = &v["outbounds"][1];
+        assert_eq!(g["type"], "selector", "自动模式也由线路控制器选线，不用 urltest");
+        assert_eq!(g["interrupt_exist_connections"], false, "换线不打断已有连接");
+    }
+
+    #[test]
     fn quic_is_rejected() {
         let v = build("");
         let r = &v["route"]["rules"][0];
@@ -194,6 +223,39 @@ mod tests {
         let v = build("");
         assert!(v["route"]["rules"].as_array().unwrap().iter().all(|r| r.get("clash_mode").is_none()));
         assert!(v["experimental"]["clash_api"].get("default_mode").is_none());
+    }
+
+    fn build_exit(exit: &str, extra: &str) -> Value {
+        let cfg = Config::parse(&format!("{exit}{extra}")).unwrap();
+        generate(&cfg, &Paths { home: r"C:\anchor-test".into() }, true).unwrap()
+    }
+
+    #[test]
+    fn direct_exit_resolves_through_the_exit_with_doh() {
+        let v = build_exit("[exit]\ntype = \"direct\"\nbind_interface = \"vpn\"\n", "");
+        let exit = &v["outbounds"][0];
+        assert_eq!(exit["domain_resolver"]["server"], TAG_EXIT_DNS);
+        assert_eq!(exit["domain_resolver"]["strategy"], "prefer_ipv4");
+        let servers = v["dns"]["servers"].as_array().unwrap();
+        let doh = servers.iter().find(|s| s["tag"] == TAG_EXIT_DNS).expect("exit-dns");
+        assert_eq!(doh["type"], "https");
+        assert_eq!(doh["server"], "1.1.1.1");
+        assert_eq!(doh["detour"], TAG_EXIT, "DoH 经出口发出");
+        assert!(servers.iter().any(|s| s["tag"] == "local"), "线路服务器的域名仍在本机解析");
+
+        // 自定义 DoH 服务器；用户自己写了 domain_resolver 就不覆盖
+        let v = build_exit("[exit]\ntype = \"direct\"\n", "[dns]\nexit_doh = \"8.8.8.8\"\n");
+        assert_eq!(v["dns"]["servers"][1]["server"], "8.8.8.8");
+        let v = build_exit("[exit]\ntype = \"direct\"\ndomain_resolver = \"local\"\n", "");
+        assert_eq!(v["outbounds"][0]["domain_resolver"], "local");
+        assert_eq!(v["dns"]["servers"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn proxy_exits_leave_domains_to_the_exit_server() {
+        let v = build("");
+        assert!(v["outbounds"][0].get("domain_resolver").is_none());
+        assert_eq!(v["dns"]["servers"].as_array().unwrap().len(), 1);
     }
 
     #[test]

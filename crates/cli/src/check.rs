@@ -327,7 +327,20 @@ fn consistency(cfg: &Config, exit: Option<&ExitInfo>, p: &mut Vec<Probe>) {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
     p.push(probe(CONS, "系统时区", St::Info, None, format!("{sys_tz}（网页和桌面客户端读取的是系统时区）")));
-    p.push(probe(CONS, "DNS / WebRTC 泄露", St::Skip, None, "P1：在 AI 专用浏览器内检测"));
+    p.push(dns_probe(cfg));
+    p.push(probe(CONS, "WebRTC 泄露", St::Skip, None, "P1c：在 AI 专用浏览器内检测"));
+}
+
+/// AI 域名在哪里解析。direct 出口由内核在本机解析：没经出口加密解析的话，查询可能绕过 VPN 明文发到本地网络。
+fn dns_probe(cfg: &Config) -> Probe {
+    const NAME: &str = "DNS";
+    if !crate::singbox::is_direct_exit(cfg) {
+        return probe(CONS, NAME, St::Pass, None, "AI 域名交给出口服务器解析，不经本机 DNS");
+    }
+    match cfg.exit.outbound.get("domain_resolver") {
+        None => probe(CONS, NAME, St::Pass, None, format!("direct 出口：AI 域名经出口用加密 DNS（DoH {}）解析，不经本地网络", cfg.dns.exit_doh.trim())),
+        Some(r) => probe(CONS, NAME, St::Warn, None, format!("direct 出口用了自定义的 domain_resolver {r}：确认它经出口解析，否则 AI 域名的查询可能绕过 VPN")),
+    }
 }
 
 /// 按设计文档的归因顺序：本地 → 内核 → 线路 → 出口 → 服务端。
@@ -477,6 +490,19 @@ mod tests {
 
     fn target(path: &str) -> crate::guard::Target {
         crate::guard::Target { label: "Claude 桌面版".into(), path: path.into() }
+    }
+
+    #[test]
+    fn dns_item_reflects_where_ai_domains_are_resolved() {
+        let cfg = |s: &str| Config::parse(s).unwrap();
+        let socks = dns_probe(&cfg("[exit]\ntype = \"socks\"\nserver = \"203.0.113.10\"\nserver_port = 1080\n"));
+        assert_eq!(socks.status, St::Pass);
+        assert!(socks.detail.contains("出口服务器"));
+        let direct = dns_probe(&cfg("[exit]\ntype = \"direct\"\n"));
+        assert_eq!(direct.status, St::Pass);
+        assert!(direct.detail.contains("DoH 1.1.1.1"), "{}", direct.detail);
+        let custom = dns_probe(&cfg("[exit]\ntype = \"direct\"\ndomain_resolver = \"local\"\n"));
+        assert_eq!(custom.status, St::Warn);
     }
 
     #[test]

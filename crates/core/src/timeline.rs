@@ -1,6 +1,6 @@
 //! 本机时间线（SQLite，WAL 模式）。只有用户代理写，命令行只读。
 //!
-//! events：一次状态变化；probes：一次探测。P1b 再加 disconnects（断联）和 exits（出口登记）。
+//! events：一次状态变化；probes：一次探测；disconnects：一次断联（P1b，版本 2）。
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 /// 探测明细保留天数
 pub const PROBE_DAYS: i64 = 7;
 /// 事件保留天数
@@ -35,6 +35,26 @@ pub struct Probe {
     pub ok: bool,
     pub ms: Option<u64>,
     pub note: String,
+}
+
+/// 一次断联及其归因。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DisconnectRow {
+    pub ts: i64,
+    pub domain: String,
+    /// open / relay
+    pub phase: String,
+    /// 错误类别（disconnect::ErrClass 的名字）
+    pub class: String,
+    pub outbound: String,
+    /// 归因（disconnect::Cause 的名字）
+    pub cause: String,
+    /// 归因依据
+    pub why: String,
+    /// 原始错误文本
+    pub raw: String,
+    /// 合并进来的错误条数
+    pub count: u32,
 }
 
 pub struct Timeline {
@@ -90,6 +110,23 @@ impl Timeline {
                      note TEXT NOT NULL DEFAULT ''
                  );
                  CREATE INDEX IF NOT EXISTS probes_ts ON probes(ts);",
+            )?;
+        }
+        if v < 2 {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS disconnects (
+                     id INTEGER PRIMARY KEY,
+                     ts INTEGER NOT NULL,
+                     domain TEXT NOT NULL,
+                     phase TEXT NOT NULL,
+                     class TEXT NOT NULL,
+                     outbound TEXT NOT NULL DEFAULT '',
+                     cause TEXT NOT NULL,
+                     why TEXT NOT NULL DEFAULT '',
+                     raw TEXT NOT NULL DEFAULT '',
+                     count INTEGER NOT NULL DEFAULT 1
+                 );
+                 CREATE INDEX IF NOT EXISTS disconnects_ts ON disconnects(ts);",
             )?;
         }
         if v > SCHEMA_VERSION {
@@ -198,13 +235,98 @@ impl Timeline {
         })
     }
 
-    /// 删除超出保留期的数据，返回 (删除的探测数, 删除的事件数)。
+    /// [from, to] 之间的探测，按时间正序（归因用）。
+    pub fn probes_between(&self, from: i64, to: i64) -> Result<Vec<Probe>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT ts, segment, target, ok, ms, note FROM probes WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts, id")?;
+            let rows = st.query_map(params![from, to], |r| {
+                Ok(Probe {
+                    ts: r.get(0)?,
+                    segment: r.get(1)?,
+                    target: r.get(2)?,
+                    ok: r.get(3)?,
+                    ms: r.get::<_, Option<i64>>(4)?.map(|m| m as u64),
+                    note: r.get(5)?,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
+    /// 某一段 from 以来的探测，按时间正序。
+    pub fn probes_of(&self, segment: &str, from: i64) -> Result<Vec<Probe>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT ts, segment, target, ok, ms, note FROM probes WHERE segment = ?1 AND ts >= ?2 ORDER BY ts, id")?;
+            let rows = st.query_map(params![segment, from], |r| {
+                Ok(Probe {
+                    ts: r.get(0)?,
+                    segment: r.get(1)?,
+                    target: r.get(2)?,
+                    ok: r.get(3)?,
+                    ms: r.get::<_, Option<i64>>(4)?.map(|m| m as u64),
+                    note: r.get(5)?,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
+    /// [from, to] 之间的事件，按时间正序（归因用）。
+    pub fn events_between(&self, from: i64, to: i64) -> Result<Vec<Event>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT ts, kind, detail FROM events WHERE ts BETWEEN ?1 AND ?2 ORDER BY ts, id")?;
+            let rows = st.query_map(params![from, to], |r| {
+                let detail: String = r.get(2)?;
+                Ok(Event { ts: r.get(0)?, kind: r.get(1)?, detail: serde_json::from_str(&detail).unwrap_or(Value::Null) })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
+    pub fn disconnect(&self, d: &DisconnectRow) {
+        let r = self.with(|c| {
+            c.execute(
+                "INSERT INTO disconnects (ts, domain, phase, class, outbound, cause, why, raw, count) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![d.ts, d.domain, d.phase, d.class, d.outbound, d.cause, d.why, d.raw, d.count],
+            )
+        });
+        if let Err(e) = r {
+            eprintln!("写时间线失败（断联）：{e:#}");
+        }
+    }
+
+    /// since 之后的断联，按时间正序。时间线还是旧版本（用户代理没升级）时返回错误。
+    pub fn disconnects_since(&self, since: i64) -> Result<Vec<DisconnectRow>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT ts, domain, phase, class, outbound, cause, why, raw, count FROM disconnects WHERE ts >= ?1 ORDER BY ts, id",
+            )?;
+            let rows = st.query_map(params![since], |r| {
+                Ok(DisconnectRow {
+                    ts: r.get(0)?,
+                    domain: r.get(1)?,
+                    phase: r.get(2)?,
+                    class: r.get(3)?,
+                    outbound: r.get(4)?,
+                    cause: r.get(5)?,
+                    why: r.get(6)?,
+                    raw: r.get(7)?,
+                    count: r.get::<_, i64>(8)? as u32,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
+    /// 删除超出保留期的数据，返回 (删除的探测数, 删除的事件和断联数)。
     pub fn prune(&self, now: i64) -> Result<(usize, usize)> {
         let day = 86_400_000i64;
         self.with(|c| {
             let p = c.execute("DELETE FROM probes WHERE ts < ?1", params![now - PROBE_DAYS * day])?;
             let e = c.execute("DELETE FROM events WHERE ts < ?1", params![now - EVENT_DAYS * day])?;
-            Ok((p, e))
+            let d = c.execute("DELETE FROM disconnects WHERE ts < ?1", params![now - EVENT_DAYS * day])?;
+            Ok((p, e + d))
         })
     }
 }
@@ -228,7 +350,16 @@ fn secs(ms: u64) -> String {
     } else if ms < 60_000 {
         format!("{:.1} 秒", ms as f64 / 1000.0)
     } else {
-        humantime::format_duration(Duration::from_secs(ms / 1000)).to_string()
+        crate::util::zh_duration(ms / 1000)
+    }
+}
+
+fn uplink_name(kind: &str) -> &str {
+    match kind {
+        "wifi" => "Wi-Fi",
+        "ethernet" => "网线",
+        "none" => "没有网络",
+        other => other,
     }
 }
 
@@ -260,7 +391,10 @@ pub fn describe(e: &Event) -> (&'static str, String) {
             let ms = n("ms").map(|m| format!("，{m} ms")).unwrap_or_default();
             ("线路切换", format!("{} → {}（{why}{ms}）；出口 IP 不变", s(d, "from"), s(d, "to")))
         }
-        "line_down" => ("线路故障", format!("线路 {} 探测失败；手动模式不自动切换", s(d, "line"))),
+        "line_down" => {
+            let why = if s(d, "why") == "pinned" { "线路已固定，不自动切换" } else { "手动模式不自动切换" };
+            ("线路故障", format!("线路 {} 探测失败；{why}", s(d, "line")))
+        }
         "line_recovered" => ("线路恢复", format!("线路已恢复，当前 {}", s(d, "line"))),
         "all_lines_down" => ("线路全断", format!("所有线路都不可用（当前 {}）；AI 新连接会失败，不会直连", s(d, "line"))),
         "guard_refresh" => {
@@ -306,6 +440,9 @@ pub fn describe(e: &Event) -> (&'static str, String) {
             format!("出口 IP 已变化：基线 {}，现在 {}；AI 通道已锁住", s(d, "baseline"), s(d, "actual")),
         ),
         "exit_unverifiable" => ("无法核对", "出口能连通，但 IP 回显服务都连不上；AI 通道保持锁住".into()),
+        "net_change" => ("网络变化", "网卡地址或默认路由变化（VPN 连接、断开、重连，或换网络）".into()),
+        "exit_switch" => ("出口切换", format!("出口 {} → {}（手动切换）；AI 服务看到的 IP 随之改变", s(d, "from"), s(d, "to"))),
+        "uplink_change" => ("换网络", format!("上行网卡变了：{} → {}", uplink_name(s(d, "from")), uplink_name(s(d, "to")))),
         "config_error" => ("配置错误", s(d, "message").to_string()),
         _ => ("其他", format!("{} {}", e.kind, e.detail)),
     }
@@ -330,6 +467,59 @@ mod tests {
         assert_eq!(only.len(), 1);
         assert_eq!(describe(&only[0]).1, "a → b（当前线路探测失败，800 ms）；出口 IP 不变");
         assert_eq!(describe(&all[1]).1, "sing-box 意外退出（退出码 1，运行了 5.0 秒），2.4 秒后恢复");
+    }
+
+    #[test]
+    fn disconnects_and_windows() {
+        let t = Timeline::memory().unwrap();
+        let row = DisconnectRow {
+            ts: 10_000,
+            domain: "claude.ai".into(),
+            phase: "open".into(),
+            class: "dns".into(),
+            outbound: "direct[exit]".into(),
+            cause: "exit".into(),
+            why: "w".into(),
+            raw: "lookup …".into(),
+            count: 3,
+        };
+        t.disconnect(&row);
+        assert_eq!(t.disconnects_since(0).unwrap(), vec![row]);
+        assert!(t.disconnects_since(20_000).unwrap().is_empty());
+
+        t.event_at(5_000, "net_change", serde_json::json!({}));
+        t.event_at(50_000, "net_change", serde_json::json!({}));
+        assert_eq!(t.events_between(0, 10_000).unwrap().len(), 1);
+        t.probe("local", "direct", true, Some(10), "");
+        let now = now_ms();
+        assert_eq!(t.probes_between(now - 60_000, now + 1_000).unwrap().len(), 1);
+        assert!(t.probes_between(0, 1_000).unwrap().is_empty());
+
+        // 断联和事件一样保留 90 天
+        let (_, e) = t.prune(10_000 + (EVENT_DAYS + 1) * 86_400_000).unwrap();
+        assert_eq!(e, 3);
+    }
+
+    #[test]
+    fn upgrades_a_version_1_timeline() {
+        let path = std::env::temp_dir().join(format!("anchor-tl-{}.db", crate::util::random_hex()));
+        {
+            let c = Connection::open(&path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE events (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '{}');
+                 CREATE TABLE probes (id INTEGER PRIMARY KEY, ts INTEGER NOT NULL, segment TEXT NOT NULL, target TEXT NOT NULL, ok INTEGER NOT NULL, ms INTEGER, note TEXT NOT NULL DEFAULT '');
+                 INSERT INTO events (ts, kind) VALUES (1, 'agent_start');
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let t = Timeline::open(&path).unwrap();
+        assert_eq!(t.events_since(0, &[], 10).unwrap().len(), 1, "旧数据保留");
+        assert!(t.disconnects_since(0).unwrap().is_empty(), "新表已建");
+        drop(t);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]

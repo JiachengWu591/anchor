@@ -104,6 +104,7 @@ pub enum KernelEvent {
 /// 预检：找到 sing-box，写入并校验配置，确认 AI 端口和探测端口空闲。返回 (sing-box 路径, 配置路径)。
 pub fn prepare(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<(PathBuf, PathBuf)> {
     let sb = find_singbox(cfg, paths)?;
+    rotate_log(&paths.log_dir().join("sing-box.log"), 20 << 20);
     let json = write_config(cfg, paths, exit_lock)?;
     check_config(&sb, &json)?;
     for (host, port) in [(cfg.proxy.listen.as_str(), cfg.proxy.port), ("127.0.0.1", cfg.probe_port())] {
@@ -112,6 +113,13 @@ pub fn prepare(cfg: &Config, paths: &Paths, exit_lock: bool) -> Result<(PathBuf,
         }
     }
     Ok((sb, json))
+}
+
+/// 内核启动前：日志超过 max 字节就改名为 .log.1（覆盖上一份），sing-box 自己不轮转。
+fn rotate_log(log: &Path, max: u64) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > max) {
+        let _ = std::fs::rename(log, log.with_extension("log.1"));
+    }
 }
 
 pub struct Options {

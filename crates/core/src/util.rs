@@ -60,9 +60,24 @@ pub fn exists_any(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
 }
 
+/// 时长写成“1 天”“9 分 35 秒”这样，省掉为零的单位。
+pub fn zh_duration(secs: u64) -> String {
+    let parts = [(secs / 86400, "天"), (secs % 86400 / 3600, "小时"), (secs % 3600 / 60, "分"), (secs % 60, "秒")];
+    let v: Vec<String> = parts.iter().filter(|(n, _)| *n > 0).map(|(n, u)| format!("{n} {u}")).collect();
+    if v.is_empty() { "0 秒".into() } else { v.join(" ") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_in_chinese() {
+        assert_eq!(zh_duration(86400), "1 天");
+        assert_eq!(zh_duration(575), "9 分 35 秒");
+        assert_eq!(zh_duration(3600 * 3 + 10), "3 小时 10 秒");
+        assert_eq!(zh_duration(0), "0 秒");
+    }
 
     #[test]
     fn cjk_width_and_pad() {
