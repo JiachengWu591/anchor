@@ -155,6 +155,8 @@ pub struct View {
     /// 最近一次核对时出口不可达
     pub exit_down: bool,
     pub locked_ms: Option<u64>,
+    /// 出口迟迟连不上、已经提醒过用户时，卡在哪一段（stall::Stuck 的名字）。由用户代理填写
+    pub stuck: Option<String>,
 }
 
 pub struct Machine {
@@ -230,6 +232,7 @@ impl Machine {
             last_ip: self.last_ip.clone(),
             exit_down: self.exit_down,
             locked_ms: self.locked_at.filter(|_| self.state.locked()).map(|t| ms(now.saturating_duration_since(t))),
+            stuck: None,
         }
     }
 

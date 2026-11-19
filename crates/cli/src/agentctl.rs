@@ -181,7 +181,11 @@ pub fn exit_line(e: &Value) -> Option<String> {
         ),
         "unverifiable" => format!("AI 通道  已锁住：出口能连通，但 IP 回显服务都连不上，无法核对{secs}"),
         "no_baseline" => "AI 通道  已锁住：还没有登记出口基线（anchor baseline）".to_string(),
-        _ if e["exit_down"].as_bool().unwrap_or(false) => format!("AI 通道  已锁住：出口不可达，恢复后核对一致再放行{secs}"),
+        _ if e["exit_down"].as_bool().unwrap_or(false) => {
+            // 迟迟连不上、用户代理已经判断出卡在哪一段时，一并说明
+            let what = e["stuck"].as_str().map(|w| format!("（{}）", anchor_core::stall::Stuck::label(w))).unwrap_or_default();
+            format!("AI 通道  已锁住：出口不可达{what}，恢复后核对一致再放行{secs}")
+        }
         _ => format!("AI 通道  正在核对出口{secs}"),
     })
 }
@@ -242,6 +246,9 @@ mod tests {
         let changed = exit_line(&json!({ "state": "changed", "baseline": "1.1.1.1", "actual": "2.2.2.2", "locked_ms": 12500 })).unwrap();
         assert!(changed.contains("现在 2.2.2.2") && changed.contains("已锁住 12 秒") && changed.contains("anchor baseline"), "{changed}");
         assert!(exit_line(&json!({ "state": "verifying", "exit_down": true })).unwrap().contains("出口不可达"));
+        // 迟迟连不上、已经判断出卡在哪一段
+        let stuck = exit_line(&json!({ "state": "verifying", "exit_down": true, "stuck": "vpn_stuck", "locked_ms": 41000 })).unwrap();
+        assert_eq!(stuck, "AI 通道  已锁住：出口不可达（VPN 卡住了），恢复后核对一致再放行，已锁住 41 秒");
     }
 
     #[test]

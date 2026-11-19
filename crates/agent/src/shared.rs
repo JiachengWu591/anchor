@@ -3,6 +3,7 @@
 use anchor_core::config::{Config, Paths};
 use anchor_core::exitlock::View as ExitView;
 use anchor_core::log;
+use anchor_core::stall::{LocalHealth, Stuck};
 use anchor_core::timeline::Timeline;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -87,6 +88,8 @@ pub struct Shared {
     pub line_kick: AtomicBool,
     /// 各线路的评分（anchor line list）；没有配置线路、会话没在运行时为空
     pub lines_view: Mutex<Option<serde_json::Value>>,
+    /// 本机网络各段探测的最新结果（持续探测写，出口迟迟连不上时用它判断卡在哪一段）
+    health: Mutex<LocalHealth>,
     st: Mutex<Status>,
     notes: Mutex<VecDeque<Note>>,
     stop_reason: Mutex<String>,
@@ -110,6 +113,7 @@ impl Shared {
             line_cmds: Mutex::new(Vec::new()),
             line_kick: AtomicBool::new(false),
             lines_view: Mutex::new(None),
+            health: Mutex::new(LocalHealth::default()),
             st: Mutex::new(st),
             notes: Mutex::new(VecDeque::new()),
             stop_reason: Mutex::new(String::new()),
@@ -137,6 +141,10 @@ impl Shared {
 
     pub fn status(&self) -> MutexGuard<'_, Status> {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn local_health(&self) -> MutexGuard<'_, LocalHealth> {
+        self.health.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// 发一条系统通知（托盘气泡）；同时写日志。
@@ -219,7 +227,11 @@ fn exit_summary(e: &ExitView) -> (Level, String) {
         "changed" => (Level::Error, format!("出口 IP 已变化（现在 {}），AI 通道已锁住", e.actual.as_deref().unwrap_or("未知"))),
         "unverifiable" => (Level::Error, "无法核对出口，AI 通道已锁住".into()),
         "no_baseline" => (Level::Warn, "未登记出口基线，AI 通道已锁住".into()),
-        _ if e.exit_down => (Level::Error, "出口不可达，AI 通道已锁住".into()),
+        _ if e.exit_down => match e.stuck.as_deref() {
+            // 迟迟连不上、已经判断出卡在哪一段：一并显示
+            Some(what) => (Level::Error, format!("出口不可达（{}），AI 通道已锁住", Stuck::label(what))),
+            None => (Level::Error, "出口不可达，AI 通道已锁住".into()),
+        },
         _ => (Level::Warn, "正在核对出口".into()),
     }
 }
@@ -256,7 +268,10 @@ mod tests {
         st.exit.state = "verifying".into();
         assert_eq!(summarize(&st), (Level::Warn, "正在核对出口".into()));
         st.exit.exit_down = true;
-        assert_eq!(summarize(&st).0, Level::Error);
+        assert_eq!(summarize(&st), (Level::Error, "出口不可达，AI 通道已锁住".into()));
+        st.exit.stuck = Some("vpn_stuck".into());
+        assert_eq!(summarize(&st), (Level::Error, "出口不可达（VPN 卡住了），AI 通道已锁住".into()));
+        st.exit.stuck = None;
         st.exit.state = "changed".into();
         st.exit.actual = Some("203.0.113.9".into());
         assert_eq!(summarize(&st), (Level::Error, "出口 IP 已变化（现在 203.0.113.9），AI 通道已锁住".into()));

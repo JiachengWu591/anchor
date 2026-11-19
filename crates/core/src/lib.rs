@@ -18,6 +18,7 @@ pub mod netwatch;
 pub mod ps;
 pub mod rules;
 pub mod singbox;
+pub mod stall;
 #[cfg(feature = "timeline")]
 pub mod timeline;
 pub mod uplink;

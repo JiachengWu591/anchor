@@ -12,6 +12,7 @@ use crate::shared::{KernelState, Shared};
 use anchor_core::config::Config;
 use anchor_core::net::{self, ClashApi};
 use anchor_core::singbox::TAG_EXIT;
+use anchor_core::stall::Reading;
 use anchor_core::uplink::{self, Uplink};
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, ToSocketAddrs};
@@ -77,6 +78,8 @@ struct LocalProbes {
     bypass_ok: HashSet<Ipv4Addr>,
     /// 上一次看到的上行网卡（外层 None：还没看过）
     last: Option<Option<Uplink>>,
+    /// 这次运行里有过上行网卡
+    ever_uplink: bool,
 }
 
 impl LocalProbes {
@@ -90,6 +93,7 @@ impl LocalProbes {
             answered: HashSet::new(),
             bypass_ok: HashSet::new(),
             last: None,
+            ever_uplink: false,
         }
     }
 
@@ -103,9 +107,26 @@ impl LocalProbes {
         }
         let had_uplink = self.last.is_some_and(|u| u.is_some());
         self.last = Some(up);
+        self.ever_uplink |= up.is_some();
+
+        // 各段的最新结果也留一份在内存里（出口迟迟连不上时，用它判断卡在哪一段）。
+        // 时间记的是这一段探测开始的时刻；测不了的段记 None
+        let started = Instant::now();
+        let dst = self.addrs.first().map(|a| *a.ip());
+        {
+            let mut h = sh.local_health();
+            h.uplink = (self.ever_uplink || up.is_some()).then_some(Reading { ok: up.is_some(), at: started });
+            h.via_vpn = via_label(up, dst) == "vpn";
+            h.vpn_seen |= h.via_vpn;
+            if up.is_none() {
+                h.lan = None;
+                h.wan = None;
+            }
+        }
 
         match up {
             Some(u) => {
+                let at = Instant::now();
                 let (ok, ms, note) = twice(|| match uplink::ping(u.gateway, PING_TIMEOUT) {
                     Ok(ms) => (true, Some(u64::from(ms)), String::new()),
                     Err(e) => (false, None, format!("{e:#}")),
@@ -113,10 +134,14 @@ impl LocalProbes {
                 if ok {
                     self.answered.insert(u.gateway);
                 }
-                if ok || self.answered.contains(&u.gateway) {
+                let known = ok || self.answered.contains(&u.gateway);
+                if known {
                     sh.tl.probe("lan", u.kind(), ok, ms, &note);
                 }
+                sh.local_health().lan = known.then_some(Reading { ok, at });
+                let mut wan = None;
                 if let Some(addr) = self.addrs.first().copied() {
+                    let at = Instant::now();
                     let (ok, ms, note) = twice(|| match uplink::tcp_via(u.if_index, addr, BYPASS_TIMEOUT) {
                         Ok(d) => (true, Some(d.as_millis() as u64), String::new()),
                         Err(e) => (false, None, format!("{e:#}")),
@@ -126,17 +151,26 @@ impl LocalProbes {
                     }
                     if ok || self.bypass_ok.contains(&u.gateway) {
                         sh.tl.probe("wan", u.kind(), ok, ms, &note);
+                        wan = Some(Reading { ok, at });
                     }
                 }
+                sh.local_health().wan = wan;
             }
             // 刚才还连着，现在找不到默认网关：Wi-Fi 断了或网线拔了
             None if had_uplink => sh.tl.probe("lan", "none", false, None, "没有连上 Wi-Fi 或网线（找不到默认网关）"),
             None => {}
         }
 
+        let at = Instant::now();
         let (ok, ms, note) = local_probe(&self.direct, &self.url);
-        let target = via_label(up, self.addrs.first().map(|a| *a.ip()));
+        let target = via_label(up, dst);
         sh.tl.probe("local", target, ok, ms, &note);
+        {
+            let mut h = sh.local_health();
+            h.local = Some(Reading { ok, at });
+            h.via_vpn = target == "vpn";
+            h.vpn_seen |= h.via_vpn;
+        }
         if ok && self.resolved_at.is_none_or(|t| t.elapsed() >= RESOLVE_EVERY) {
             self.resolve();
         }
