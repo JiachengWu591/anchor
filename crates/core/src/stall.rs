@@ -158,7 +158,9 @@ pub fn notice(s: Stuck, locked: Duration, ctx: &NoticeCtx) -> (String, String) {
                 Some(name) => format!("出口走的网卡“{name}”没有连接"),
                 None => "现在没有经 VPN 上网".to_string(),
             };
-            format!("Wi-Fi 和宽带正常，但{which}，出口连不上，已经 {dur}。在 VPN 客户端里重新连接；恢复后自动核对出口并放行。")
+            // 真机上 Wi-Fi 断开再回来后，VPN 客户端有时过一分钟自己连回来，有时一直不回来；
+            // 提醒发出时分不出是哪一种，所以先说可能在自动重连，再说等不到就手动连。
+            format!("Wi-Fi 和宽带正常，但{which}，出口连不上，已经 {dur}。VPN 客户端可能正在自动重连；一两分钟后还没恢复，就在客户端里手动重新连接。恢复后自动核对出口并放行。")
         }
         Stuck::Local => format!("已经 {dur}。可能是 VPN 卡住了，也可能是宽带不通：先在 VPN 客户端里断开再重新连接，不行再检查宽带。"),
         Stuck::Exit => {
@@ -528,6 +530,8 @@ mod tests {
         let (title, body) = notice(Stuck::VpnOff, secs(95), &NoticeCtx { bind_if: Some("vpn0"), has_backup: false });
         assert_eq!(title, "VPN 没有连接，AI 通道已锁住");
         assert!(body.contains("“vpn0”没有连接") && body.contains("1 分 35 秒"), "{body}");
+        // VPN 客户端可能自己连回来：先说等一等，再说手动重连
+        assert!(body.contains("可能正在自动重连") && body.contains("还没恢复，就在客户端里手动重新连接"), "{body}");
         assert!(notice(Stuck::VpnOff, secs(95), &ctx).1.contains("没有经 VPN 上网"));
         assert!(notice(Stuck::Link, secs(30), &ctx).0.starts_with("Wi-Fi 或网线没有连上"));
         assert!(notice(Stuck::Broadband, secs(30), &ctx).1.contains("路由器连得上"));
