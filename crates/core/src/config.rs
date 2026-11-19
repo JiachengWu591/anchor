@@ -101,6 +101,8 @@ pub struct SwitchCfg {
     pub watch_interval: String,
     /// 出口 IP 定时核对的间隔（网络变化、内核启动时另外立即核对）
     pub exit_check_interval: String,
+    /// AI 通道因为出口连不上锁住多久之后发通知，说明卡在哪一段；"0s" 或空表示不通知
+    pub stall_notice_after: String,
 }
 impl Default for SwitchCfg {
     fn default() -> Self {
@@ -112,10 +114,20 @@ impl Default for SwitchCfg {
             tolerance_ms: 50,
             watch_interval: "3s".into(),
             exit_check_interval: "60s".into(),
+            stall_notice_after: "30s".into(),
         }
     }
 }
 impl SwitchCfg {
+    /// 出口连不上、AI 通道锁住多久之后提醒；None 表示不提醒。
+    pub fn stall_notice(&self) -> Option<std::time::Duration> {
+        let s = self.stall_notice_after.trim();
+        if s.is_empty() {
+            return None;
+        }
+        humantime::parse_duration(s).ok().filter(|d| !d.is_zero())
+    }
+
     /// 出口定时核对间隔，至少 5 秒。
     pub fn exit_check_every(&self) -> std::time::Duration {
         humantime::parse_duration(self.exit_check_interval.trim())
@@ -385,6 +397,15 @@ impl Config {
                 bail!("[switch] watch_interval 至少 1s（\"0s\" 表示关闭）");
             }
         }
+        let s = self.switch.stall_notice_after.trim();
+        if !s.is_empty() {
+            let d = humantime::parse_duration(s)
+                .with_context(|| format!("[switch] stall_notice_after 格式错误：{s}（例如 \"30s\"，\"0s\" 表示不通知）"))?;
+            // 网络变化后的头十几秒各段探测还没跟上，太短会说错
+            if !d.is_zero() && d < std::time::Duration::from_secs(10) {
+                bail!("[switch] stall_notice_after 至少 10s（\"0s\" 表示不通知）");
+            }
+        }
         if !matches!(self.browser.engine.as_str(), "edge" | "chrome") {
             bail!("[browser] engine 只能是 edge 或 chrome");
         }
@@ -562,6 +583,9 @@ tolerance_ms = 50            # 只在前台调试的 anchor up 里起作用（ur
 watch_interval = "3s"
 # 出口 IP 定时核对（至少 5 秒）。网络变化、内核启动时会先锁住 AI 通道并立即核对，与基线一致才放行
 exit_check_interval = "60s"
+# 出口连不上、AI 通道锁住这么久还没恢复，就发通知说明卡在哪一段（Wi-Fi、宽带、VPN 还是出口）和该怎么做。
+# 至少 10 秒；"0s" 不通知。VPN 几秒内自己重连好的不会通知
+stall_notice_after = "30s"
 
 [apps]
 # 纳入 AI Anchor 的程序，名称见 `anchor scan`。
@@ -756,6 +780,14 @@ mod tests {
         assert_ne!(cfg.probe_auth().1, other.probe_auth().1, "密码随 api_secret 变化");
         assert!(Config::parse(&format!("{MIN}[core]\nprobe_port = 17890\n")).is_err(), "与 AI 端口冲突");
         assert!(Config::parse(&format!("{MIN}[switch]\nexit_check_interval = \"soon\"\n")).is_err());
+        // 出口迟迟连不上时的提醒：默认 30 秒，"0s" 或空表示不提醒，太短不行
+        assert_eq!(cfg.switch.stall_notice(), Some(std::time::Duration::from_secs(30)));
+        let off = |v: &str| Config::parse(&format!("{MIN}[switch]\nstall_notice_after = \"{v}\"\n")).map(|c| c.switch.stall_notice());
+        assert_eq!(off("0s").unwrap(), None);
+        assert_eq!(off("").unwrap(), None);
+        assert_eq!(off("2m").unwrap(), Some(std::time::Duration::from_secs(120)));
+        assert!(off("5s").is_err(), "至少 10 秒");
+        assert!(off("later").is_err());
         assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"http://x/204\"\n")).is_ok(), "http 测速地址也可以");
         assert!(Config::parse(&format!("{MIN}[switch]\nprobe_url = \"x/204\"\n")).is_err(), "测速地址要带协议");
         assert!(Config::parse(&format!("{MIN}[dns]\nexit_doh = \"dns.google\"\n")).is_err(), "DoH 服务器要写 IP");

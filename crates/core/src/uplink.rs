@@ -14,8 +14,8 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{INVALID_HANDLE_VALUE, NO_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
-    FreeMibTable, GetBestInterface, GetIpForwardTable2, GetIpInterfaceEntry, ICMP_ECHO_REPLY, IcmpCloseHandle, IcmpCreateFile,
-    IcmpSendEcho, InitializeIpInterfaceEntry, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+    ConvertInterfaceAliasToLuid, FreeMibTable, GetBestInterface, GetIpForwardTable2, GetIpInterfaceEntry, ICMP_ECHO_REPLY,
+    IcmpCloseHandle, IcmpCreateFile, IcmpSendEcho, InitializeIpInterfaceEntry, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
 };
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET, FD_SET, FIONBIO, IN_ADDR, IN_ADDR_0, INVALID_SOCKET, IP_UNICAST_IF, IPPROTO_IP, IPPROTO_TCP, SO_ERROR, SOCK_STREAM, SOCKADDR,
@@ -81,6 +81,22 @@ fn interface_metric(if_index: u32) -> u32 {
         row.Family = AF_INET;
         row.InterfaceIndex = if_index;
         if GetIpInterfaceEntry(&mut row) == NO_ERROR { row.Metric } else { u32::MAX / 2 }
+    }
+}
+
+/// 名字（别名）是 alias 的网卡此刻有没有连接。没有这块网卡也算没连接：
+/// VPN 的虚拟网卡在断开时常常整个消失。
+pub fn iface_connected(alias: &str) -> bool {
+    let wide: Vec<u16> = alias.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: 别名是以 0 结尾的 UTF-16 串；出参和行都是本地变量，行先由系统初始化
+    unsafe {
+        let mut row: MIB_IPINTERFACE_ROW = std::mem::zeroed();
+        InitializeIpInterfaceEntry(&mut row);
+        row.Family = AF_INET;
+        if ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut row.InterfaceLuid) != NO_ERROR {
+            return false;
+        }
+        GetIpInterfaceEntry(&mut row) == NO_ERROR && row.Connected as u8 != 0
     }
 }
 
@@ -223,5 +239,21 @@ mod tests {
         let lo = route_if(Ipv4Addr::LOCALHOST).unwrap_or(1);
         let r = tcp_via(lo, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 9), Duration::from_millis(500));
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn a_missing_adapter_counts_as_not_connected() {
+        assert!(!iface_connected("ai-anchor-没有这块网卡"));
+        assert!(!iface_connected(""));
+    }
+
+    /// 看本机某几块网卡此刻算不算连接着：
+    /// `ANCHOR_IFACES=WLAN,名字2 cargo test -p anchor-core --features timeline iface_states -- --ignored --nocapture`
+    #[test]
+    #[ignore = "要给出本机的网卡名"]
+    fn iface_states() {
+        for name in std::env::var("ANCHOR_IFACES").unwrap_or_default().split(',').filter(|s| !s.is_empty()) {
+            println!("{name}: connected = {}", iface_connected(name));
+        }
     }
 }

@@ -440,6 +440,10 @@ pub fn describe(e: &Event) -> (&'static str, String) {
             format!("出口 IP 已变化：基线 {}，现在 {}；AI 通道已锁住", s(d, "baseline"), s(d, "actual")),
         ),
         "exit_unverifiable" => ("无法核对", "出口能连通，但 IP 回显服务都连不上；AI 通道保持锁住".into()),
+        "exit_stalled" => {
+            let locked = n("locked_ms").map(|m| format!("AI 通道已锁住 {}，", secs(m))).unwrap_or_default();
+            ("久未恢复", format!("{locked}{}；已发通知", crate::stall::Stuck::label(s(d, "what"))))
+        }
         "net_change" => ("网络变化", "网卡地址或默认路由变化（VPN 连接、断开、重连，或换网络）".into()),
         "exit_switch" => ("出口切换", format!("出口 {} → {}（手动切换）；AI 服务看到的 IP 随之改变", s(d, "from"), s(d, "to"))),
         "uplink_change" => ("换网络", format!("上行网卡变了：{} → {}", uplink_name(s(d, "from")), uplink_name(s(d, "to")))),
@@ -537,6 +541,10 @@ mod tests {
         assert_eq!(
             describe(&ev("exit_ip_changed", json!({ "baseline": "1.1.1.1", "actual": "2.2.2.2" }))).1,
             "出口 IP 已变化：基线 1.1.1.1，现在 2.2.2.2；AI 通道已锁住"
+        );
+        assert_eq!(
+            describe(&ev("exit_stalled", json!({ "what": "vpn_stuck", "locked_ms": 34000 }))),
+            ("久未恢复", "AI 通道已锁住 34.0 秒，VPN 卡住了；已发通知".to_string())
         );
     }
 

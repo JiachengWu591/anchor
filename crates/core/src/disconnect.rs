@@ -454,7 +454,34 @@ pub fn lock_summary(d: &Disconnect, probes: &[Probe], now: i64) -> Option<String
     if !parts.is_empty() {
         s.push_str(&format!("；锁住期间{}", parts.join("、")));
     }
+    if let Some(gap) = l.until.and_then(|u| recovery_gap(probes, l.since, u)) {
+        s.push_str(&gap);
+    }
     Some(s)
+}
+
+/// 网络恢复后还要等这么久才放行，才值得单独写一句
+const RECOVERY_GAP_MS: i64 = 20_000;
+
+/// 锁住期间，路由器或绕开 VPN 那一段断过、后来恢复了，放行却又等了很久：把两段时间分开写。
+/// 实测：Wi-Fi 只断了 12 秒，恢复后 VPN 卡了一分半；整段归因是“本地”，只看归因会以为 Wi-Fi 断了那么久。
+fn recovery_gap(probes: &[Probe], since: i64, until: i64) -> Option<String> {
+    let lower = |p: &&Probe| (p.segment == "lan" || p.segment == "wan") && p.ts >= since && p.ts <= until;
+    let last_fail = probes.iter().filter(lower).filter(|p| !p.ok).map(|p| p.ts).max()?;
+    let first_ok = |seg: &str| probes.iter().filter(lower).filter(|p| p.segment == seg && p.ok && p.ts > last_fail).map(|p| p.ts).min();
+    // 绕开 VPN 那一段通了，路由器和宽带就都通了；没有这一段的数据时只能说路由器
+    let (back, what) = match first_ok("wan") {
+        Some(t) => (t, "Wi-Fi 和宽带"),
+        None => (first_ok("lan")?, "路由器"),
+    };
+    let rest = until - back;
+    if rest < RECOVERY_GAP_MS {
+        return None;
+    }
+    let vpn = probes.iter().any(|p| p.segment == "local" && p.target == "vpn" && !p.ok && p.ts > back && p.ts <= until);
+    let tail = if vpn { "之后经 VPN 仍然不通" } else { "之后出口仍然连不上" };
+    let zh = |ms: i64| crate::util::zh_duration((ms.max(0) / 1000) as u64);
+    Some(format!("；{what}在锁住约 {}后恢复，{tail}，又过了 {}才放行", zh(back - since), zh(rest)))
 }
 
 /// 锁住事件和日志里的模式切换相差不超过这么久，就是同一次（日志时间只到秒）
@@ -774,6 +801,48 @@ mod tests {
         d.lock = Some(LockSpan { since: 90_000, until: Some(313_000) });
         assert!(lock_summary(&d, &[], 0).unwrap().starts_with("锁住 3 分 43 秒，拦下 55 次 AI 连接"));
         assert_eq!(lock_summary(&dc(ErrClass::Timeout), &probes, 0), None);
+    }
+
+    /// 真机实测的两次锁住（时间换成从 0 起的毫秒）。
+    #[test]
+    fn lock_summary_separates_the_network_outage_from_the_wait_after_it() {
+        // Wi-Fi 关了 12 秒；恢复后经 VPN 一直不通，手动重连 VPN 后才放行，一共锁住 105 秒
+        let mut d = locked_dc(0, 8_000);
+        d.count = 99;
+        d.lock = Some(LockSpan { since: 0, until: Some(105_000) });
+        let probes = vec![
+            probe(1_000, "lan", "none", false),
+            probe(13_000, "lan", "wifi", true),
+            probe(13_000, "wan", "wifi", true),
+            probe(25_000, "local", "vpn", false),
+            probe(38_000, "local", "vpn", false),
+            probe(38_000, "lan", "wifi", true),
+            probe(38_000, "wan", "wifi", true),
+            probe(98_000, "local", "direct", true),
+        ];
+        let s = lock_summary(&d, &probes, 0).unwrap();
+        assert!(s.starts_with("锁住 1 分 45 秒，拦下 99 次 AI 连接；锁住期间路由器探测 3 次失败 1 次"), "{s}");
+        assert!(s.ends_with("；Wi-Fi 和宽带在锁住约 13 秒后恢复，之后经 VPN 仍然不通，又过了 1 分 32 秒才放行"), "{s}");
+
+        // 网络恢复后 8 秒就放行：不值得多写一句
+        d.lock = Some(LockSpan { since: 0, until: Some(27_000) });
+        let quick = vec![probe(11_000, "lan", "wifi", false), probe(11_000, "wan", "wifi", false), probe(19_000, "lan", "wifi", true), probe(19_000, "wan", "wifi", true)];
+        assert!(!lock_summary(&d, &quick, 0).unwrap().contains("恢复"));
+
+        // 路由器和宽带一直没断过（单纯的 VPN 卡住）：归因已经说清楚了
+        d.lock = Some(LockSpan { since: 0, until: Some(197_000) });
+        let vpn_only = vec![probe(5_000, "lan", "wifi", true), probe(5_000, "wan", "wifi", true), probe(9_000, "local", "vpn", false)];
+        assert!(!lock_summary(&d, &vpn_only, 0).unwrap().contains("恢复"));
+
+        // 还锁着、或者断了就没再通过：没有“恢复”可说
+        d.lock = Some(LockSpan { since: 0, until: None });
+        assert!(!lock_summary(&d, &probes, 200_000).unwrap().contains("恢复"));
+        d.lock = Some(LockSpan { since: 0, until: Some(105_000) });
+        assert!(!lock_summary(&d, &[probe(1_000, "lan", "none", false)], 0).unwrap().contains("恢复"));
+
+        // 绕开 VPN 那一段测不了：只能说路由器；之后没有经 VPN 的探测，就说出口
+        let lan_only = vec![probe(1_000, "lan", "wifi", false), probe(13_000, "lan", "wifi", true), probe(40_000, "chain", "exit", false)];
+        assert!(lock_summary(&d, &lan_only, 0).unwrap().ends_with("；路由器在锁住约 13 秒后恢复，之后出口仍然连不上，又过了 1 分 32 秒才放行"));
     }
 
     #[test]

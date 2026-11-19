@@ -10,7 +10,9 @@ use anchor_core::config::Config;
 use anchor_core::exitlock::{self, Action, Check, Machine, Severity, Timing, Trigger};
 use anchor_core::log;
 use anchor_core::net::{self, ClashApi};
-use anchor_core::singbox::{MODE_LOCK, MODE_OPEN, TAG_EXIT};
+use anchor_core::singbox::{self, MODE_LOCK, MODE_OPEN, TAG_EXIT};
+use anchor_core::stall::{self, Lock, NoticeCtx, StallNote, StallWatch, Stuck};
+use anchor_core::uplink;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -59,6 +61,10 @@ pub fn spawn(sh: Arc<Shared>, cfg: &Config, stop: Arc<AtomicBool>, kernel_gen: A
         sources: sources(cfg),
         baseline: cfg.expect.ip.trim().to_string(),
         timing: Timing::new(cfg.switch.exit_check_every()),
+        stall_after: cfg.switch.stall_notice(),
+        exit_on_route: singbox::is_direct_exit(cfg) && cfg.lines.is_empty(),
+        bind_if: cfg.exit.outbound.get("bind_interface").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        has_backup: cfg.exits.len() > 1,
     };
     thread::spawn(move || run(&sh, &ctx, &stop, &kernel_gen))
 }
@@ -76,6 +82,13 @@ struct Ctx {
     sources: Vec<String>,
     baseline: String,
     timing: Timing,
+    /// 出口连不上、锁住多久之后提醒（None：不提醒）
+    stall_after: Option<Duration>,
+    /// 出口从本机按系统路由直接出去（direct 出口、没有线路）
+    exit_on_route: bool,
+    /// 出口绑定的网卡名
+    bind_if: Option<String>,
+    has_backup: bool,
 }
 
 /// 正在进行的一次核对：结果通道（结果和耗时）、来源、发起时间，以及发起时的内核代数和网络代数。
@@ -122,6 +135,9 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
     let mut settle_until = Instant::now();
     // 网络变化事件写进时间线（断联归因用），一串通知只记一条
     let mut last_net_event: Option<Instant> = None;
+    // 出口迟迟连不上时的提醒
+    let mut stall = StallWatch::new(ctx.stall_after);
+    let mut last_route_look: Option<Instant> = None;
 
     // 每次触发都丢掉进行中的核对：它走的可能是旧路径，等它超时只会拖慢放行
     while !stop.load(Ordering::SeqCst) {
@@ -215,8 +231,50 @@ fn run(sh: &Arc<Shared>, ctx: &Ctx, stop: &AtomicBool, kernel_gen: &AtomicU64) {
             }
         }
 
-        sh.status().exit = m.view(Instant::now());
+        let now = Instant::now();
+        let mut view = m.view(now);
+        watch_stall(sh, ctx, &mut stall, &mut last_route_look, now, &view);
+        view.stuck = stall.notified().map(|s| s.name().to_string());
+        sh.status().exit = view;
         seen_poke = sh.wait_poke(seen_poke, Duration::from_millis(250));
+    }
+}
+
+/// 出口连不上、AI 通道锁了很久还没恢复：看卡在哪一段，提醒一次；提醒过的锁住恢复时再通知一次。
+fn watch_stall(sh: &Shared, ctx: &Ctx, stall: &mut StallWatch, last_route_look: &mut Option<Instant>, now: Instant, view: &exitlock::View) {
+    let mut lock = Lock::of(view.locked, &view.state, view.exit_down);
+    // 线路全断时线路控制器已经通知过，不重复
+    if lock == Lock::ExitDown && sh.status().lines_down {
+        lock = Lock::Verifying;
+    }
+    let locked_for = Duration::from_millis(view.locked_ms.unwrap_or(0));
+    let (diag, fallback) = if stall.wants_diagnosis(lock, locked_for) {
+        // 路由和网卡状态一秒看一次就够
+        if last_route_look.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(1)) {
+            *last_route_look = Some(now);
+            let via_vpn = crate::health::local_via() == "vpn";
+            let exit_if_down = ctx.bind_if.as_deref().is_some_and(|name| !uplink::iface_connected(name));
+            let mut h = sh.local_health();
+            h.via_vpn = via_vpn;
+            h.vpn_seen |= via_vpn;
+            h.exit_if_down = exit_if_down;
+        }
+        let h = *sh.local_health();
+        (stall::diagnose(&h, now.checked_sub(locked_for), ctx.exit_on_route), stall::diagnose(&h, None, ctx.exit_on_route).unwrap_or(Stuck::Exit))
+    } else {
+        (None, Stuck::Exit)
+    };
+    match stall.tick(now, lock, locked_for, diag, fallback) {
+        Some(StallNote::Stuck(what, locked)) => {
+            sh.tl.event("exit_stalled", serde_json::json!({ "what": what.name(), "locked_ms": locked.as_millis() as u64 }));
+            let (title, body) = stall::notice(what, locked, &NoticeCtx { bind_if: ctx.bind_if.as_deref(), has_backup: ctx.has_backup });
+            sh.notify(Level::Warn, &title, &body);
+        }
+        Some(StallNote::Recovered(locked)) => {
+            let (title, body) = stall::recovered_notice(&ctx.baseline, locked);
+            sh.notify(Level::Info, &title, &body);
+        }
+        None => {}
     }
 }
 
