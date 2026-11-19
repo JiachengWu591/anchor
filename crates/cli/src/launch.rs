@@ -133,9 +133,16 @@ pub fn browser_exe(cfg: &Config) -> Result<PathBuf> {
 /// AI 专用浏览器参数：独立配置目录（独立实例，不影响日常浏览器）、固定代理、
 /// 禁 QUIC、WebRTC 不走代理外的 UDP、界面和 Accept-Language 与出口一致。
 pub fn browser_args(cfg: &Config, paths: &Paths, url: &str) -> Vec<String> {
-    let mut args = vec![format!("--user-data-dir={}", paths.browser_profile(&cfg.browser.profile).display())];
+    browser_args_in(cfg, &paths.browser_profile(&cfg.browser.profile), url)
+}
+
+/// 同上，配置目录由调用方指定（体检用临时目录跑同一套参数）。
+pub fn browser_args_in(cfg: &Config, profile: &Path, url: &str) -> Vec<String> {
+    let mut args = vec![format!("--user-data-dir={}", profile.display())];
     args.extend(chromium_proxy_args(cfg));
     args.extend([
+        // 实测 Edge 147、Chrome 157 只认不带 force- 的写法，旧写法不报错也不生效；两个都带上，照顾旧版本。
+        "--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string(),
         format!("--lang={}", cfg.expect.language),
         "--no-first-run".into(),
@@ -215,6 +222,7 @@ mod tests {
         assert_eq!(a[0], r"--user-data-dir=C:\anchor\browser\ai-anchor");
         assert!(a.contains(&"--proxy-server=http://127.0.0.1:17890".to_string()));
         assert!(a.contains(&"--disable-quic".to_string()));
+        assert!(a.contains(&"--webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()), "新版 Chromium 只认这个写法");
         assert!(a.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
         assert!(a.contains(&"--lang=ja-JP".to_string()));
         assert_eq!(a.last().unwrap(), "https://claude.ai");

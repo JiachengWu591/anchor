@@ -2,8 +2,9 @@
 //! P0 只做一次性；P1 改为后台定时探测并存入 SQLite 时间线。
 
 use crate::config::{Config, Paths, host_port};
+use crate::consist::{self, BrowserSeen, Resolver, Typed};
 use crate::net::{self, ClashApi, ExitInfo};
-use crate::netenv;
+use crate::{launch, netenv};
 use crate::util::{now_rfc3339, pad};
 use anyhow::Result;
 use serde::Serialize;
@@ -80,7 +81,8 @@ fn probe(segment: &'static str, name: impl Into<String>, status: St, latency: Op
     Probe { segment, name: name.into(), status, latency_ms: latency.map(|d| d.as_millis() as u64), detail: detail.into(), outage: None }
 }
 
-pub fn run(cfg: &Config) -> Report {
+/// quick：跳过要联网查库或启动浏览器的一致性检测（IP 类型、DNS 泄露实测、浏览器）。
+pub fn run(cfg: &Config, quick: bool) -> Report {
     let mut p = Vec::new();
 
     // 1. 本地网络：不经代理访问连通性检测地址
@@ -192,7 +194,7 @@ pub fn run(cfg: &Config) -> Report {
     }
 
     // 6. 一致性
-    consistency(cfg, exit_info.as_ref(), &mut p);
+    consistency(cfg, exit_info.as_ref(), core_up, quick, &mut p);
 
     // 7. 守卫
     let apps_empty = cfg.apps.desktop.is_empty() && cfg.apps.cli.is_empty() && cfg.guard.extra_programs.is_empty();
@@ -295,7 +297,7 @@ fn region_blocked(r: &net::HttpResult) -> bool {
     u.contains("unavailable-in-region") || b.contains("unsupported_country") || b.contains("unavailable in your region")
 }
 
-fn consistency(cfg: &Config, exit: Option<&ExitInfo>, p: &mut Vec<Probe>) {
+fn consistency(cfg: &Config, exit: Option<&ExitInfo>, core_up: bool, quick: bool, p: &mut Vec<Probe>) {
     match exit {
         Some(info) => {
             let tz = info.timezone.as_deref().unwrap_or("");
@@ -320,20 +322,117 @@ fn consistency(cfg: &Config, exit: Option<&ExitInfo>, p: &mut Vec<Probe>) {
         }
         None => p.push(probe(CONS, "时区 / 语言", St::Skip, None, "没有拿到出口信息")),
     }
-    let sys_tz = std::process::Command::new("tzutil")
-        .arg("/g")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    p.push(probe(CONS, "系统时区", St::Info, None, format!("{sys_tz}（网页和桌面客户端读取的是系统时区）")));
     p.push(dns_probe(cfg));
-    p.push(probe(CONS, "WebRTC 泄露", St::Skip, None, "P1c：在 AI 专用浏览器内检测"));
+
+    // 下面三样要联网查库或启动浏览器，同时进行
+    let agent = if core_up { net::agent_for_checks(cfg, Duration::from_secs(10)).ok() } else { None };
+    let want_types = !quick && !cfg.check.ip_type.is_empty();
+    let want_dns = !quick && cfg.check.dns_leak;
+    let want_browser = !quick && cfg.check.browser;
+    let (types, dns, seen) = std::thread::scope(|s| {
+        let types = match (&agent, exit) {
+            (Some(a), Some(info)) if want_types => Some(s.spawn(move || consist::fetch_ip_types(a, &cfg.check.ip_type, &info.ip))),
+            _ => None,
+        };
+        let dns = match &agent {
+            Some(a) if want_dns => Some(s.spawn(move || consist::dns_leak_test(a))),
+            _ => None,
+        };
+        let seen = want_browser.then(|| s.spawn(move || browser_seen(cfg)));
+        (
+            types.map(|h| h.join().unwrap_or_default()),
+            dns.map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("检测线程出错")))),
+            seen.map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("检测线程出错")))),
+        )
+    });
+    let skipped = |on: bool, off: &str| {
+        if quick {
+            "--quick：跳过".to_string()
+        } else if !on {
+            format!("已在 [check] {off} 里关掉")
+        } else if !core_up {
+            "内核未运行".to_string()
+        } else {
+            "没有拿到出口信息".to_string()
+        }
+    };
+    p.push(ip_type_probe(types.as_deref(), || skipped(want_types, "ip_type")));
+    p.push(dns_leak_probe(dns, exit, || skipped(want_dns, "dns_leak")));
+    let offset = types.as_deref().and_then(consist::exit_offset_secs);
+    browser_probes(seen, exit, offset, &cfg.expect.language, || skipped(want_browser, "browser"), p);
+}
+
+fn ip_type_probe(types: Option<&[Typed]>, why_not: impl Fn() -> String) -> Probe {
+    const NAME: &str = "出口 IP 类型";
+    match types {
+        Some(t) => {
+            let (st, detail) = consist::ip_type_summary(t);
+            probe(CONS, NAME, st, None, detail)
+        }
+        None => probe(CONS, NAME, St::Skip, None, why_not()),
+    }
+}
+
+fn dns_leak_probe(res: Option<Result<Vec<Resolver>>>, exit: Option<&ExitInfo>, why_not: impl Fn() -> String) -> Probe {
+    const NAME: &str = "DNS 泄露实测";
+    match res {
+        Some(Ok(r)) => {
+            let (st, detail) = consist::dns_leak_summary(&r, exit.and_then(|e| e.country.as_deref()));
+            probe(CONS, NAME, st, None, detail)
+        }
+        Some(Err(e)) => probe(CONS, NAME, St::Skip, None, format!("检测服务 bash.ws 用不了，这次测不出：{e:#}")),
+        None => probe(CONS, NAME, St::Skip, None, why_not()),
+    }
+}
+
+/// 用 AI 专用浏览器的那套启动参数（换成临时配置目录）无头打开检测页。
+fn browser_seen(cfg: &Config) -> Result<BrowserSeen> {
+    let exe = launch::browser_exe(cfg)?;
+    consist::browser_check(&exe, |profile, url| {
+        let mut args = launch::browser_args_in(cfg, profile, url);
+        args.insert(args.len() - 1, "--headless=new".into());
+        args
+    })
+}
+
+fn browser_probes(
+    seen: Option<Result<BrowserSeen>>,
+    exit: Option<&ExitInfo>,
+    exit_offset_secs: Option<i64>,
+    language: &str,
+    why_not: impl Fn() -> String,
+    p: &mut Vec<Probe>,
+) {
+    match seen {
+        Some(Ok(s)) => {
+            let (st, detail) = consist::webrtc_summary(&s, exit.map(|e| e.ip.as_str()));
+            p.push(probe(CONS, "WebRTC", st, None, detail));
+            let (st, detail) = consist::timezone_summary(&s, exit.and_then(|e| e.timezone.as_deref()), exit_offset_secs);
+            p.push(probe(CONS, "浏览器时区", st, None, detail));
+            let (st, detail) = consist::language_summary(&s, language);
+            p.push(probe(CONS, "浏览器语言", st, None, detail));
+        }
+        other => {
+            let why = match other {
+                Some(Err(e)) => format!("没能在 AI 专用浏览器里检测：{e:#}"),
+                _ => why_not(),
+            };
+            p.push(probe(CONS, "WebRTC / 浏览器时区 / 语言", St::Skip, None, why));
+            // 浏览器里测不了时，至少把系统时区列出来
+            let sys_tz = std::process::Command::new("tzutil")
+                .arg("/g")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            p.push(probe(CONS, "系统时区", St::Info, None, format!("{sys_tz}（网页和桌面客户端读取的是系统时区）")));
+        }
+    }
 }
 
 /// AI 域名在哪里解析。direct 出口由内核在本机解析：没经出口加密解析的话，查询可能绕过 VPN 明文发到本地网络。
 fn dns_probe(cfg: &Config) -> Probe {
-    const NAME: &str = "DNS";
+    const NAME: &str = "DNS 配置";
     if !crate::singbox::is_direct_exit(cfg) {
         return probe(CONS, NAME, St::Pass, None, "AI 域名交给出口服务器解析，不经本机 DNS");
     }
@@ -371,6 +470,8 @@ fn attribute(p: &[Probe], has_lines: bool, vpn: Option<&str>) -> String {
         } else {
             format!("有 AI 服务连不上，{} 官方也报告了服务异常：多半是服务端的问题", outages.join("、"))
         }
+    } else if failed(CONS) {
+        "通道可用，但一致性检测发现了泄露（见 FAIL）".into()
     } else if failed(LINE) {
         "通道可用：部分线路不可用，自动切换会避开它们".into()
     } else if !outages.is_empty() {
@@ -421,6 +522,54 @@ mod tests {
         assert!(attribute(&p, false, None).contains("路径"));
         let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass)];
         assert_eq!(attribute(&p, false, None), "全部正常");
+    }
+
+    #[test]
+    fn a_leak_is_named_in_the_verdict() {
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Pass), pr(AI, St::Pass), pr(CONS, St::Fail)];
+        assert!(attribute(&p, false, None).contains("泄露"));
+        // 通道本身的故障排在前面
+        let p = vec![pr(LOCAL, St::Pass), pr(CORE, St::Pass), pr(EXIT, St::Fail), pr(CONS, St::Fail)];
+        assert!(attribute(&p, false, None).contains("出口"));
+    }
+
+    #[test]
+    fn slow_consistency_items_say_why_they_were_skipped() {
+        let x = ip_type_probe(None, || "--quick：跳过".into());
+        assert_eq!((x.status, x.detail.as_str()), (St::Skip, "--quick：跳过"));
+        let x = dns_leak_probe(Some(Err(anyhow::anyhow!("HTTP 503"))), None, String::new);
+        assert_eq!(x.status, St::Skip);
+        assert!(x.detail.contains("bash.ws") && x.detail.contains("HTTP 503"), "{}", x.detail);
+
+        // 浏览器里测不了：一项说明原因，再列出系统时区
+        let mut p = Vec::new();
+        browser_probes(Some(Err(anyhow::anyhow!("找不到 msedge.exe"))), None, None, "en-US", String::new, &mut p);
+        assert_eq!(p.len(), 2);
+        assert!(p[0].detail.contains("找不到 msedge.exe"), "{}", p[0].detail);
+        assert_eq!(p[1].name, "系统时区");
+
+        // 测到了：WebRTC、时区、语言各一项
+        let seen = BrowserSeen {
+            timezone: Some("America/Los_Angeles".into()),
+            offset_min: Some(-480),
+            languages: vec!["en-US".into()],
+            accept_language: Some("en-US,en;q=0.9".into()),
+            ..Default::default()
+        };
+        let exit = ExitInfo {
+            ip: "203.0.113.10".into(),
+            country: Some("US".into()),
+            region: None,
+            city: None,
+            timezone: Some("America/Los_Angeles".into()),
+            org: None,
+            source: String::new(),
+        };
+        let mut p = Vec::new();
+        browser_probes(Some(Ok(seen)), Some(&exit), None, "en-US", String::new, &mut p);
+        let names: Vec<&str> = p.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["WebRTC", "浏览器时区", "浏览器语言"]);
+        assert!(p.iter().all(|x| x.status == St::Pass));
     }
 
     #[test]
