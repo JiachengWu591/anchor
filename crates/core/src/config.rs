@@ -185,13 +185,26 @@ impl Default for DnsCfg {
 
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct CheckCfg { pub local_url: String, pub ip_info: String, pub ip_echo: Vec<String> }
+pub struct CheckCfg {
+    pub local_url: String,
+    pub ip_info: String,
+    pub ip_echo: Vec<String>,
+    /// 判断出口 IP 类型时问哪些数据库（ip-api、ipquery、proxycheck）；空列表表示不问
+    pub ip_type: Vec<String>,
+    /// anchor check 是否实测 DNS 泄露（经通道解析检测服务的一次性域名）
+    pub dns_leak: bool,
+    /// anchor check 是否在无头的 AI 专用浏览器里检测 WebRTC、时区和语言
+    pub browser: bool,
+}
 impl Default for CheckCfg {
     fn default() -> Self {
         Self {
             local_url: "http://www.msftconnecttest.com/connecttest.txt".into(),
             ip_info: "https://ipinfo.io/json".into(),
             ip_echo: vec!["https://api.ipify.org".into(), "https://ifconfig.me/ip".into()],
+            ip_type: vec!["ip-api".into(), "ipquery".into(), "proxycheck".into()],
+            dns_leak: true,
+            browser: true,
         }
     }
 }

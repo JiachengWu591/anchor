@@ -6,6 +6,7 @@
 
 mod agentctl;
 mod check;
+mod consist;
 mod exitcmd;
 mod launch;
 mod linecmd;
@@ -89,6 +90,9 @@ enum Cmd {
         /// 输出 JSON
         #[arg(long)]
         json: bool,
+        /// 跳过较慢的一致性检测（出口 IP 类型、DNS 泄露实测、浏览器里的 WebRTC / 时区 / 语言）
+        #[arg(long)]
+        quick: bool,
     },
     /// 经通道测量出口，并登记为基线（expect.ip / timezone / country）
     Baseline {
@@ -311,9 +315,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Timeline { since, kind, probes, limit, json } => {
             timeline::print(&paths, &timeline::Query { since: since.into(), kinds: kind, probes, limit, json })?
         }
-        Cmd::Check { json } => {
+        Cmd::Check { json, quick } => {
             let cfg = Config::load(&paths)?;
-            let report = check::run(&cfg);
+            let report = check::run(&cfg, quick);
             // 在 MSIX 应用里写的记录会进它的私有目录，不写
             let file = if pkg.is_none() { Some(check::save(&paths, &report)?) } else { None };
             if json {
