@@ -256,6 +256,17 @@ impl Timeline {
         })
     }
 
+    /// since 以来每个“本地小时”里有探测记录的分钟数：(本地小时序号, 分钟数)。
+    /// 本地小时序号 = (时间戳 + 时区偏移) / 一小时。持续探测每 10 秒一次，所以有记录的分钟就是用户代理在运行的分钟：
+    /// 关机、睡眠、用户代理没开的时间不在里面。
+    pub fn observed_minutes(&self, since: i64, offset_ms: i64) -> Result<Vec<(i64, u32)>> {
+        self.with(|c| {
+            let mut st = c.prepare("SELECT (ts + ?2) / 3600000, COUNT(DISTINCT ts / 60000) FROM probes WHERE ts >= ?1 GROUP BY 1 ORDER BY 1")?;
+            let rows = st.query_map(params![since, offset_ms], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? as u32)))?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
     /// [from, to] 之间的探测，按时间正序（归因用）。
     pub fn probes_between(&self, from: i64, to: i64) -> Result<Vec<Probe>> {
         self.with(|c| {
@@ -350,6 +361,11 @@ impl Timeline {
             Ok((p, e + d))
         })
     }
+}
+
+/// 本机时区比 UTC 快多少毫秒（东八区是 8 小时）。
+pub fn local_offset_ms() -> i64 {
+    i64::from(chrono::Local::now().offset().local_minus_utc()) * 1000
 }
 
 /// 本地时间，如 2026-11-12 10:31:02。
@@ -524,6 +540,11 @@ mod tests {
         let last = t.last_probes(now - 60_000).unwrap();
         assert_eq!(last.iter().map(|p| (p.segment.as_str(), p.target.as_str(), p.ok)).collect::<Vec<_>>(), [("lan", "wifi", true), ("local", "vpn", false)]);
         assert!(t.last_probes(now + 60_000).unwrap().is_empty());
+        // 这一小时里有记录的分钟数（上面几条探测都在同一分钟里，除非正好跨了分钟）
+        let seen = t.observed_minutes(now - 60_000, 0).unwrap();
+        assert!(matches!(seen.len(), 1 | 2) && seen.iter().map(|x| x.1).sum::<u32>() <= 2, "{seen:?}");
+        assert!(seen.iter().all(|x| (x.0 - now.div_euclid(3_600_000)).abs() <= 1), "{seen:?}");
+        assert!(t.observed_minutes(now + 60_000, 0).unwrap().is_empty());
         assert!(t.probes_between(0, 1_000).unwrap().is_empty());
 
         // 断联和事件一样保留 90 天

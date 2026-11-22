@@ -4,8 +4,8 @@
 use crate::config::Paths;
 use crate::util::pad;
 use anchor_core::disconnect::{Cause, ErrClass};
-use anchor_core::report::{Summary, UNKNOWN_TARGET, lock_spans, segment_label, summarize, trigger_label};
-use anchor_core::timeline::{DisconnectRow, Timeline, local_time, now_ms};
+use anchor_core::report::{Summary, UNKNOWN_TARGET, by_hour_of_day, hours_summary, lock_spans, segment_label, summarize, trigger_label};
+use anchor_core::timeline::{DisconnectRow, Timeline, local_offset_ms, local_time, now_ms};
 use anchor_core::util::zh_duration;
 use anyhow::{Context, Result};
 use std::time::Duration;
@@ -22,12 +22,24 @@ pub fn run(paths: &Paths, since: Duration, list: bool, json: bool) -> Result<()>
     // 锁住可能开始于报告起点之前：多取一天的事件来推算锁住时段
     let spans = lock_spans(&tl.events_since(since_ms - 86_400_000, &[], usize::MAX)?, now_ms());
     let s = summarize(since_ms, &rows, &events, &probes, &exit_checks, &spans);
+    // 按钟点看：一天里什么时候最容易锁住
+    let offset = local_offset_ms();
+    let times: Vec<i64> = rows.iter().map(|r| r.ts).collect();
+    let hours = by_hour_of_day(since_ms, now_ms(), offset, &tl.observed_minutes(since_ms, offset)?, &spans, &times);
     if json {
-        let v = serde_json::json!({ "summary": s, "disconnects": if list { serde_json::to_value(&rows)? } else { serde_json::Value::Null } });
+        let v = serde_json::json!({
+            "summary": s,
+            "by_hour": hours,
+            "disconnects": if list { serde_json::to_value(&rows)? } else { serde_json::Value::Null },
+        });
         println!("{}", serde_json::to_string_pretty(&v)?);
         return Ok(());
     }
     print_text(&s, since, list);
+    // 不到三天的数据看不出“每天这个时候”的规律
+    if since >= Duration::from_secs(3 * 86_400) {
+        println!("时段  {}", hours_summary(&hours));
+    }
     if list {
         print_list(&rows);
     }

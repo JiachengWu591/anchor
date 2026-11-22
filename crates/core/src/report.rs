@@ -34,6 +34,7 @@ pub struct Summary {
 }
 
 /// AI 通道锁住的时间段，按事件推算：锁住、出口 IP 变化、内核启动（用户代理的内核以锁住状态启动）开始，放行结束。
+/// 用户代理退出时也结束：内核跟着停了，之后到下次启动不算“锁住”。
 pub fn lock_spans(events: &[Event], now: i64) -> Vec<(i64, i64)> {
     let mut spans = Vec::new();
     let mut start: Option<i64> = None;
@@ -42,7 +43,7 @@ pub fn lock_spans(events: &[Event], now: i64) -> Vec<(i64, i64)> {
             "exit_locked" | "exit_ip_changed" | "kernel_start" | "agent_start" => {
                 start.get_or_insert(e.ts);
             }
-            "exit_unlocked" => {
+            "exit_unlocked" | "agent_stop" => {
                 if let Some(s) = start.take() {
                     spans.push((s, e.ts));
                 }
@@ -54,6 +55,91 @@ pub fn lock_spans(events: &[Event], now: i64) -> Vec<(i64, i64)> {
         spans.push((s, now));
     }
     spans
+}
+
+pub const HOUR_MS: i64 = 3_600_000;
+/// 某一天的某个钟点里用户代理至少运行了这么久，这一天才算“看到了这个钟点”
+const SEEN_MS: i64 = 20 * 60_000;
+/// 某一天的某个钟点里至少锁了这么久，才算“这一天这个钟点锁住过”（几秒的核对不算）
+const LOCKED_MS: i64 = 60_000;
+/// 一个钟点至少在这么多天里看到过，才拿来比较哪个钟点最容易锁住
+pub const MIN_DAYS: u32 = 3;
+
+/// 一天里的一个钟点（本机时区），几天的数据合起来看。
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct HourOfDay {
+    /// 0～23
+    pub hour: u8,
+    /// 有几天看到了这个钟点（用户代理在运行）
+    pub days: u32,
+    /// 其中有几天在这个钟点锁住过
+    pub days_locked: u32,
+    /// 这个钟点里用户代理在运行的时间，几天合计。关机、睡眠的时间不算
+    pub observed_ms: u64,
+    /// 其中 AI 通道锁住的时间
+    pub locked_ms: u64,
+    pub disconnects: usize,
+}
+
+/// 按钟点汇总 [since, now] 里 AI 通道锁住的情况，用来看一天里什么时候最不稳。
+///
+/// 排名看“有几天锁住过”，不看锁住的总时长：实测有一晚 VPN 断了 4 个小时，
+/// 按总时长算，那 4 个钟点会一起排到最前面，其实只是一次事故。
+///
+/// - offset_ms：本机时区比 UTC 快多少（期间换过夏令时的话有一小时的误差，不处理）。
+/// - observed：`Timeline::observed_minutes` 的结果。锁住的时间不超过观测到的时间：电脑睡着时锁住的时段不会被放大。
+/// - spans：锁住的时段；disconnects：每次断联的时间。
+pub fn by_hour_of_day(since: i64, now: i64, offset_ms: i64, observed: &[(i64, u32)], spans: &[(i64, i64)], disconnects: &[i64]) -> Vec<HourOfDay> {
+    let mut v: Vec<HourOfDay> = (0..24).map(|hour| HourOfDay { hour, ..Default::default() }).collect();
+    for &(idx, minutes) in observed {
+        let a = (idx * HOUR_MS - offset_ms).max(since);
+        let b = ((idx + 1) * HOUR_MS - offset_ms).min(now);
+        if b <= a {
+            continue;
+        }
+        let seen = (i64::from(minutes.min(60)) * 60_000).min(b - a);
+        let locked: i64 = spans.iter().map(|(s, e)| ((*e).min(b) - (*s).max(a)).max(0)).sum::<i64>().min(seen);
+        let h = &mut v[idx.rem_euclid(24) as usize];
+        h.observed_ms += seen as u64;
+        h.locked_ms += locked as u64;
+        if seen >= SEEN_MS {
+            h.days += 1;
+            h.days_locked += u32::from(locked >= LOCKED_MS);
+        }
+    }
+    for &ts in disconnects.iter().filter(|t| **t >= since && **t <= now) {
+        v[(ts + offset_ms).div_euclid(HOUR_MS).rem_euclid(24) as usize].disconnects += 1;
+    }
+    v
+}
+
+/// 最容易锁住的几个钟点：只比看到过足够多天的钟点，按“锁住过的天数占比”从高到低，再按锁住的时长。
+/// 只在一天里锁住过的不算规律，不列。
+pub fn worst_hours(hours: &[HourOfDay], n: usize) -> Vec<&HourOfDay> {
+    let share = |h: &HourOfDay| f64::from(h.days_locked) / f64::from(h.days.max(1));
+    let mut v: Vec<&HourOfDay> = hours.iter().filter(|h| h.days >= MIN_DAYS && h.days_locked >= 2).collect();
+    v.sort_by(|a, b| share(b).total_cmp(&share(a)).then(b.locked_ms.cmp(&a.locked_ms)).then(a.hour.cmp(&b.hour)));
+    v.truncate(n);
+    v
+}
+
+/// 一句话说哪些钟点最容易锁住。多数日子都锁住过才叫高峰；否则照实说没有明显的高峰，只列出天数最多的。
+pub fn hours_summary(hours: &[HourOfDay]) -> String {
+    let worst = worst_hours(hours, 3);
+    let Some(top) = worst.first() else {
+        return "没有哪个钟点在两天以上锁住过，看不出高峰时段".to_string();
+    };
+    let list: Vec<String> = worst.iter().map(|h| hour_phrase(h)).collect();
+    if top.days_locked * 2 >= top.days {
+        format!("最容易锁住的钟点：{}", list.join("、"))
+    } else {
+        format!("没有明显的高峰时段。锁住过的天数最多的钟点：{}", list.join("、"))
+    }
+}
+
+/// “19 点（6 天里有 4 天锁住过，共 42 分）”
+pub fn hour_phrase(h: &HourOfDay) -> String {
+    format!("{:02} 点（{} 天里有 {} 天锁住过，共 {}）", h.hour, h.days, h.days_locked, crate::util::zh_duration(h.locked_ms / 1000))
 }
 
 /// exit_checks：这段时间的出口核对明细；locked：AI 通道锁住的时段。出口核对只算放行期间的定时核对：
@@ -215,6 +301,67 @@ mod tests {
             ev(30, "exit_ip_changed"),
         ];
         assert_eq!(lock_spans(&events, 40), vec![(1, 3), (10, 20), (30, 40)]);
+        // 锁着时用户代理退出了：算到退出为止，下次启动另起一段
+        let events = vec![ev(10, "exit_locked"), ev(15, "agent_stop"), ev(100, "agent_start"), ev(103, "exit_unlocked")];
+        assert_eq!(lock_spans(&events, 200), vec![(10, 15), (100, 103)]);
+    }
+
+    #[test]
+    fn hours_of_day_count_the_days_with_a_lock() {
+        const H: i64 = HOUR_MS;
+        let day = 24 * H;
+        // 东八区。本地小时序号 = (时间戳 + 偏移) / 一小时
+        let off = 8 * H;
+        let idx = |d: i64, hour: i64| d * 24 + hour;
+        let at = |d: i64, hour: i64, min: i64| idx(d, hour) * H - off + min * 60_000;
+        let (since, now) = (at(100, 0, 0), at(104, 0, 0));
+        // 四天。19 点每天都在运行，其中三天锁住过；
+        // 4 点到 7 点每天都在运行，只有一晚 VPN 断了 4 个小时；3 点只运行过 30 分钟，睡着时“锁了”一小时
+        let mut observed = vec![(idx(102, 3), 30)];
+        for d in 100..104 {
+            observed.push((idx(d, 19), 60));
+            for hour in 4..8 {
+                observed.push((idx(d, hour), 60));
+            }
+        }
+        let spans = vec![
+            (at(100, 19, 10), at(100, 19, 25)),
+            (at(101, 19, 0), at(101, 19, 5)),
+            // 跨到 20 点的那一段不在观测到的小时里，不算
+            (at(102, 19, 50), at(102, 20, 30)),
+            // 只锁了 20 秒的核对：不算“这一天锁住过”
+            (at(103, 19, 0), at(103, 19, 0) + 20_000),
+            (at(101, 4, 0), at(101, 8, 0)),
+            (at(102, 3, 0), at(102, 4, 0)),
+        ];
+        let dcs = vec![at(100, 19, 12), at(102, 19, 51), at(101, 5, 31), since - day, now + 1];
+        let v = by_hour_of_day(since, now, off, &observed, &spans, &dcs);
+        assert_eq!(v.len(), 24);
+        let h = |n: usize| (v[n].days, v[n].days_locked, v[n].locked_ms / 60_000, v[n].disconnects);
+        assert_eq!(h(19), (4, 3, 30, 2), "15 + 5 + 10 分钟，外加 20 秒");
+        assert_eq!(v[19].observed_ms, 4 * H as u64);
+        assert_eq!(h(5), (4, 1, 60, 1), "那一晚的事故在这个钟点只算一天");
+        assert_eq!(h(3), (1, 1, 30, 0), "最多算观测到的 30 分钟");
+        assert_eq!(h(20), (0, 0, 0, 0));
+        // 按总时长，4 到 7 点（各 60 分钟）会排在 19 点（30 分钟）前面；按天数，只有 19 点是规律
+        let worst = worst_hours(&v, 3);
+        assert_eq!(worst.iter().map(|x| x.hour).collect::<Vec<_>>(), [19]);
+        assert_eq!(hour_phrase(worst[0]), "19 点（4 天里有 3 天锁住过，共 30 分 20 秒）");
+        assert_eq!(hours_summary(&v), "最容易锁住的钟点：19 点（4 天里有 3 天锁住过，共 30 分 20 秒）");
+        // 最多的钟点也只有不到一半的日子锁住过：照实说没有明显的高峰
+        let mut mild = v.clone();
+        mild[19].days = 7;
+        assert!(hours_summary(&mild).starts_with("没有明显的高峰时段。锁住过的天数最多的钟点：19 点（7 天里有 3 天"), "{}", hours_summary(&mild));
+        mild[19].days_locked = 1;
+        assert_eq!(hours_summary(&mild), "没有哪个钟点在两天以上锁住过，看不出高峰时段");
+        // 天数占比相同的，锁得久的在前
+        let mut more = v.clone();
+        more[5].days_locked = 3;
+        assert_eq!(worst_hours(&more, 3).iter().map(|x| x.hour).collect::<Vec<_>>(), [5, 19]);
+        // 统计范围以外的小时不算；别的时区落在别的钟点
+        assert!(by_hour_of_day(now, now + day, off, &observed, &spans, &dcs).iter().all(|x| x.observed_ms == 0 && x.locked_ms == 0));
+        let utc = by_hour_of_day(since - day, now, 0, &[(idx(100, 19) - 8, 60)], &[(at(100, 19, 10), at(100, 19, 25))], &[at(100, 19, 12)]);
+        assert_eq!((utc[11].days, utc[11].days_locked, utc[11].locked_ms / 60_000, utc[11].disconnects), (1, 1, 15, 1));
     }
 
     #[test]
