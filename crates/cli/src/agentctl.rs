@@ -106,6 +106,21 @@ pub fn reload() -> Result<()> {
     Ok(())
 }
 
+/// anchor panel：请用户代理打开面板窗口；print 时只输出地址。面板的网页由用户代理提供。
+pub fn panel(print: bool) -> Result<()> {
+    let method = if print { "panel.url" } else { "panel.open" };
+    let v = match call(method, Value::Null) {
+        Ok(v) => v,
+        Err(CallError::NotRunning) => bail!("anchor-agent 没有运行，先运行 anchor agent start"),
+        Err(e) => bail!("打开面板失败：{e}（用户代理可能还是旧版本，重装并重启它）"),
+    };
+    match v["url"].as_str() {
+        Some(url) if print => println!("{url}"),
+        _ => println!("已打开面板。"),
+    }
+    Ok(())
+}
+
 /// 记录一条事件到时间线（用户代理没运行时忽略）。
 pub fn record(kind: &str, detail: Value) {
     let _ = call("event", json!({ "kind": kind, "detail": detail }));

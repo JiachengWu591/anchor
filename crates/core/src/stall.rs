@@ -69,6 +69,10 @@ impl Stuck {
         }
     }
 
+    pub fn from_name(name: &str) -> Option<Stuck> {
+        [Stuck::Link, Stuck::Broadband, Stuck::VpnStuck, Stuck::VpnOff, Stuck::Local, Stuck::Exit].into_iter().find(|s| s.name() == name)
+    }
+
     /// 一句话说明（时间线、托盘提示、anchor agent status 共用）
     pub fn label(name: &str) -> &'static str {
         match name {

@@ -1,12 +1,12 @@
 //! 最小的原生托盘：图标随状态变化（正常 / 注意 / 故障），右键菜单，系统通知用托盘气泡。
-//! 面板留到 P2。
+//! 左键点图标打开面板（panel 模块）。
 
+use crate::actions;
 use crate::shared::{Level, Shared};
 use anchor_core::log;
 use anchor_core::win::wide;
 use anyhow::{Result, bail};
 use std::ffi::c_void;
-use std::os::windows::process::CommandExt;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -26,6 +26,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_STATUS: usize = 1;
+const ID_PANEL: usize = 2;
 const ID_TIMELINE: usize = 10;
 const ID_CHECK: usize = 11;
 const ID_FOLDER: usize = 12;
@@ -33,7 +34,6 @@ const ID_RECHECK: usize = 13;
 const ID_REPORT: usize = 14;
 const ID_RELOAD: usize = 20;
 const ID_QUIT: usize = 30;
-const CREATE_NEW_CONSOLE: u32 = 0x10;
 
 static SHARED: OnceLock<Arc<Shared>> = OnceLock::new();
 static HWND_: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
@@ -115,16 +115,15 @@ fn balloon(hwnd: HWND, level: Level, title: &str, body: &str) {
 /// 在新控制台窗口里运行 anchor.exe 的一条命令（结束后等回车再关）。
 fn run_cli(args: &[&str]) {
     let Some(sh) = SHARED.get() else { return };
-    let Some(exe) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("anchor.exe"))) else { return };
-    let r = std::process::Command::new(&exe)
-        .arg("--home")
-        .arg(&sh.paths.home)
-        .args(args)
-        .arg("--pause")
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn();
-    if let Err(e) = r {
-        sh.notify(Level::Error, "无法打开命令行", &format!("{}：{e}", exe.display()));
+    if let Err(e) = actions::run_cli(sh, args) {
+        sh.notify(Level::Error, "无法打开命令行", &format!("{e:#}"));
+    }
+}
+
+fn open_panel() {
+    if let Some(sh) = SHARED.get() {
+        // 失败时 open 自己会发通知
+        let _ = sh.panel.open(sh);
     }
 }
 
@@ -139,6 +138,7 @@ fn show_menu(hwnd: HWND) {
         };
         item(MF_STRING | MF_GRAYED, ID_STATUS, &format!("AI Anchor：{text}"));
         AppendMenuW(m, MF_SEPARATOR, 0, null());
+        item(MF_STRING, ID_PANEL, "打开面板");
         item(MF_STRING, ID_TIMELINE, "查看时间线（最近 24 小时）");
         item(MF_STRING, ID_REPORT, "断联报告（最近 7 天）");
         item(MF_STRING, ID_CHECK, "运行体检");
@@ -154,21 +154,15 @@ fn show_menu(hwnd: HWND) {
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, null()) as usize;
         DestroyMenu(m);
         match cmd {
+            ID_PANEL => open_panel(),
             ID_TIMELINE => run_cli(&["timeline", "--since", "24h"]),
             ID_REPORT => run_cli(&["report", "--since", "7d"]),
             ID_CHECK => run_cli(&["check"]),
-            ID_RECHECK => {
-                sh.recheck.store(true, Ordering::SeqCst);
-                sh.poke();
-            }
+            ID_RECHECK => actions::recheck(sh),
             ID_FOLDER => {
-                let explorer = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into()).join("explorer.exe");
-                let _ = std::process::Command::new(explorer).arg(&sh.paths.home).spawn();
+                let _ = actions::open_folder(sh);
             }
-            ID_RELOAD => {
-                sh.reload.store(true, Ordering::SeqCst);
-                sh.notify(Level::Info, "正在重新加载配置", "内核会按新配置重启，几秒内恢复。");
-            }
+            ID_RELOAD => actions::reload(sh),
             ID_QUIT => {
                 sh.request_stop("托盘菜单退出");
                 DestroyWindow(hwnd);
@@ -182,9 +176,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let tc = TASKBAR_CREATED.load(Ordering::SeqCst);
     match msg {
         WM_TRAY => {
-            let ev = lp as u32;
-            if ev == WM_RBUTTONUP || ev == WM_LBUTTONUP {
-                show_menu(hwnd);
+            // 左键打开面板，右键出菜单
+            match lp as u32 {
+                WM_LBUTTONUP => open_panel(),
+                WM_RBUTTONUP => show_menu(hwnd),
+                _ => {}
             }
             0
         }
