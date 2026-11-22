@@ -33,6 +33,29 @@ pub struct Summary {
     pub probes: Vec<(String, u64, u64)>,
 }
 
+impl Summary {
+    /// 把锁住的次数和总时长换成按锁住的时段算的（`summarize` 给的是把每次放行时记下的时长加起来）。
+    ///
+    /// 放行时记下的时长会少算：锁着的时候用户代理重启过，只记重启之后的那一段；锁着时退出用户代理的那一次没有放行，不计。
+    /// 实测 7 天按那样加是 3 小时 23 分，按时段算是 7 小时 55 分，差的主要是一次夜里 4 个多小时的断网。
+    ///
+    /// - spans：`lock_spans` 的结果；hours：同一段时间的 `by_hour_of_day`，里面锁住的时长已经以有探测记录的时间为上限。
+    /// - horizon：还留着的最早一条探测的时间（没有探测时传 now）。比它更早的时候没有探测记录，
+    ///   没法用“在运行的时间”做上限，那一段仍然用放行时记下的时长。
+    /// - events：统计时段里的事件。
+    pub fn set_locks(&mut self, now: i64, events: &[Event], spans: &[(i64, i64)], hours: &[HourOfDay], horizon: i64) {
+        let n = spans.iter().filter(|(s, e)| *e >= self.since_ms && *s <= now).count();
+        let recorded: usize = self.lock_triggers.iter().map(|t| t.1).sum();
+        if n > recorded {
+            // 没等到放行的：锁着时退出了用户代理，或者现在还锁着
+            self.lock_triggers.push(("unfinished".into(), n - recorded));
+        }
+        self.locks = n.max(recorded);
+        let before: u64 = events.iter().filter(|e| e.kind == "exit_unlocked" && e.ts < horizon).filter_map(|e| e.detail["locked_ms"].as_u64()).sum();
+        self.locked_ms = before + hours.iter().map(|h| h.locked_ms).sum::<u64>();
+    }
+}
+
 /// AI 通道锁住的时间段，按事件推算：锁住、出口 IP 变化、内核启动（用户代理的内核以锁住状态启动）开始，放行结束。
 /// 用户代理退出时也结束：内核跟着停了，之后到下次启动不算“锁住”。
 pub fn lock_spans(events: &[Event], now: i64) -> Vec<(i64, i64)> {
@@ -211,6 +234,7 @@ pub fn trigger_label(t: &str) -> &str {
         "kernel_start" => "内核启动",
         "exit_down" => "出口不可达",
         "recheck" => "手动核对",
+        "unfinished" => "没等到放行",
         "periodic" => "定时核对",
         "" => "其他",
         other => other,
@@ -304,6 +328,50 @@ mod tests {
         // 锁着时用户代理退出了：算到退出为止，下次启动另起一段
         let events = vec![ev(10, "exit_locked"), ev(15, "agent_stop"), ev(100, "agent_start"), ev(103, "exit_unlocked")];
         assert_eq!(lock_spans(&events, 200), vec![(10, 15), (100, 103)]);
+    }
+
+    #[test]
+    fn lock_totals_come_from_the_spans() {
+        const H: i64 = HOUR_MS;
+        let ev = |ts: i64, kind: &str, detail| Event { ts, kind: kind.into(), detail };
+        let unlock = |ts: i64, locked_ms: i64, trigger: &str| ev(ts, "exit_unlocked", json!({ "trigger": trigger, "locked_ms": locked_ms }));
+        // 第 10 小时：锁了 5 分钟后放行。
+        // 第 12 小时：锁住后电脑没关好就断了电（没有“代理停止”），第 20 小时重新开机，又锁了 10 分钟才放行：
+        //   放行时只记了重启后的 10 分钟，锁着运行的另外 40 分钟（第 12 小时的 20 到 60 分）没记。
+        // 第 22 小时：锁着时退出了用户代理，没有放行。
+        let events = vec![
+            ev(10 * H, "exit_locked", json!({ "reason": "exit_down" })),
+            unlock(10 * H + 300_000, 300_000, "exit_down"),
+            ev(12 * H + 20 * 60_000, "exit_locked", json!({ "reason": "exit_down" })),
+            ev(20 * H, "agent_start", json!({})),
+            unlock(20 * H + 600_000, 600_000, "kernel_start"),
+            ev(22 * H, "exit_locked", json!({ "reason": "network_change" })),
+            ev(22 * H + 120_000, "agent_stop", json!({})),
+        ];
+        let (since, now) = (0, 24 * H);
+        let spans = lock_spans(&events, now);
+        assert_eq!(spans.len(), 3);
+        let mut s = summarize(since, &[], &events, &[], &[], &spans);
+        assert_eq!((s.locks, s.locked_ms), (2, 900_000), "放行时记下的：2 次，共 15 分钟");
+
+        // 第 13 到 19 小时电脑关着，没有探测记录
+        let observed: Vec<(i64, u32)> = [10, 11, 12, 20, 21, 22].iter().map(|h| (*h, 60)).collect();
+        let hours = by_hour_of_day(since, now, 0, &observed, &spans, &[]);
+        s.set_locks(now, &events, &spans, &hours, 0);
+        assert_eq!(s.locks, 3, "没放行的那一次也算");
+        assert_eq!(s.locked_ms, (5 + 40 + 10 + 2) * 60_000, "关机的 7 个小时不算，重启前锁着运行的 40 分钟算");
+        assert_eq!(s.lock_triggers.iter().map(|t| (t.0.as_str(), t.1)).collect::<Vec<_>>(), [("exit_down", 1), ("kernel_start", 1), ("unfinished", 1)]);
+        assert_eq!(trigger_label("unfinished"), "没等到放行");
+
+        // 探测明细只留 7 天：更早的那一段没有“在运行的时间”可用，仍然用放行时记下的时长
+        let mut old = summarize(since, &[], &events, &[], &[], &spans);
+        let recent: Vec<(i64, u32)> = [20, 21, 22].iter().map(|h| (*h, 60)).collect();
+        old.set_locks(now, &events, &spans, &by_hour_of_day(since, now, 0, &recent, &spans, &[]), 20 * H);
+        assert_eq!(old.locked_ms, (5 + 10 + 2) * 60_000, "第 10 小时的 5 分钟来自放行记录，之后的来自时段");
+        // 完全没有探测记录（horizon 传 now）：和原来一样
+        let mut none = summarize(since, &[], &events, &[], &[], &spans);
+        none.set_locks(now, &events, &spans, &by_hour_of_day(since, now, 0, &[], &spans, &[]), now);
+        assert_eq!((none.locks, none.locked_ms), (3, 900_000));
     }
 
     #[test]
