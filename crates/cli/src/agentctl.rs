@@ -5,8 +5,8 @@ use crate::ipc::{self, AGENT_PIPE, CallError};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -49,26 +49,43 @@ fn command_line(exe: &std::path::Path, home: &std::path::Path) -> String {
     format!("\"{}\" --home \"{}\"", exe.display(), home.display().to_string().trim_end_matches('\\'))
 }
 
+/// 不让之后启动的进程继承本进程的标准输入输出。
+///
+/// 输出被管道接走时（脚本里捕获输出，或者 anchor agent start | more），子进程即使不用这条管道也会继承它：
+/// 用户代理常驻后台，管道就一直不关，读管道的那一方等不到结束。
+fn keep_std_handles_private() {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{HANDLE, HANDLE_FLAG_INHERIT, SetHandleInformation};
+    let handles = [std::io::stdin().as_raw_handle(), std::io::stdout().as_raw_handle(), std::io::stderr().as_raw_handle()];
+    for h in handles.into_iter().filter(|h| !h.is_null()) {
+        unsafe { SetHandleInformation(h as HANDLE, HANDLE_FLAG_INHERIT, 0) };
+    }
+}
+
+/// 在后台启动一个用户代理进程，不等它就绪。no_tray：不显示托盘图标（沿用被替换的那个用户代理的设置）。
+pub fn spawn_agent(exe: &Path, home: &Path, no_tray: bool) -> Result<Child> {
+    keep_std_handles_private();
+    let spawn = |flags: u32| {
+        let mut c = Command::new(exe);
+        c.arg("--home").arg(home);
+        if no_tray {
+            c.arg("--no-tray");
+        }
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).creation_flags(flags).spawn()
+    };
+    // 脱离当前终端的作业对象，关掉终端后用户代理继续运行
+    spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+        .or_else(|_| spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
+        .with_context(|| format!("无法启动 {}", exe.display()))
+}
+
 pub fn start(paths: &Paths) -> Result<()> {
     if running() {
         println!("anchor-agent 已在运行。");
         return Ok(());
     }
     let exe = sibling("anchor-agent.exe")?;
-    let spawn = |flags: u32| {
-        Command::new(&exe)
-            .arg("--home")
-            .arg(&paths.home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(flags)
-            .spawn()
-    };
-    // 脱离当前终端的作业对象，关掉终端后用户代理继续运行
-    spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
-        .or_else(|_| spawn(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
-        .with_context(|| format!("无法启动 {}", exe.display()))?;
+    spawn_agent(&exe, &paths.home, false)?;
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if running() {
@@ -268,7 +285,7 @@ mod tests {
 
     #[test]
     fn command_line_quotes_paths_and_drops_trailing_backslash() {
-        let l = command_line(std::path::Path::new(r"C:\Program Files\AI Anchor\anchor-agent.exe"), std::path::Path::new(r"D:\a b\AIAnchor\"));
+        let l = command_line(Path::new(r"C:\Program Files\AI Anchor\anchor-agent.exe"), Path::new(r"D:\a b\AIAnchor\"));
         assert_eq!(l, r#""C:\Program Files\AI Anchor\anchor-agent.exe" --home "D:\a b\AIAnchor""#);
     }
 }
