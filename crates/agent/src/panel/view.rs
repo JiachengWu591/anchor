@@ -351,14 +351,22 @@ pub struct Hour {
 
 const HOUR_MS: i64 = 3_600_000;
 
-/// 到当前这个钟点为止的 24 个小时。spans：AI 通道锁住的时段。
-pub fn hours(now: i64, spans: &[(i64, i64)], rows: &[DisconnectRow]) -> Vec<Hour> {
-    let end = now - now.rem_euclid(HOUR_MS) + HOUR_MS;
+/// 到当前这个钟点为止的 24 个小时（按本机时区的整点分）。spans：AI 通道锁住的时段。
+///
+/// 和“按钟点看”同一个口径：一小时里锁住的时间不超过这一小时里有探测记录的时间（observed），
+/// 电脑睡着、关机的时候不算锁住。horizon 是还留着的最早一条探测的时间：比它更早的小时没有探测记录可比，不设上限。
+pub fn hours(now: i64, offset_ms: i64, observed: &[(i64, u32)], horizon: i64, spans: &[(i64, i64)], rows: &[DisconnectRow]) -> Vec<Hour> {
+    let last = (now + offset_ms).div_euclid(HOUR_MS);
     (0..24)
         .map(|k| {
-            let a = end - (24 - k) * HOUR_MS;
+            let idx = last - 23 + k;
+            let a = idx * HOUR_MS - offset_ms;
             let b = (a + HOUR_MS).min(now);
-            let locked: i64 = spans.iter().map(|(s, e)| ((*e).min(b) - (*s).max(a)).max(0)).sum();
+            let mut locked: i64 = spans.iter().map(|(s, e)| ((*e).min(b) - (*s).max(a)).max(0)).sum();
+            if b > horizon {
+                let seen = observed.iter().find(|o| o.0 == idx).map_or(0, |o| i64::from(o.1.min(60)) * 60_000);
+                locked = locked.min(seen);
+            }
             Hour {
                 start_ms: a,
                 label: local_time(a).get(11..13).unwrap_or("").to_string(),
@@ -420,12 +428,19 @@ pub fn history(tl: &Timeline, now: i64) -> Result<Value> {
     // 锁住可能开始于统计起点之前：多取一天的事件来推算锁住时段
     let events8 = tl.events_since(now - 8 * day, &[], usize::MAX)?;
     let spans = report::lock_spans(&events8, now);
-    let period = |span: i64| -> Result<Value> {
+    let offset = local_offset_ms();
+    let observed = tl.observed_minutes(now - 7 * day, offset)?;
+    let horizon = tl.oldest_probe()?.unwrap_or(now);
+    let times: Vec<i64> = rows7.iter().map(|r| r.ts).collect();
+    let period = |span: i64| -> Result<(Value, Vec<report::HourOfDay>)> {
         let since = now - span;
         let rows: Vec<DisconnectRow> = rows7.iter().filter(|r| r.ts >= since).cloned().collect();
         let events: Vec<Event> = events8.iter().filter(|e| e.ts >= since).cloned().collect();
-        let s = report::summarize(since, &rows, &events, &tl.probe_summary(since)?, &tl.probes_of("exit", since)?, &spans);
-        Ok(summary_json(&s))
+        let mut s = report::summarize(since, &rows, &events, &tl.probe_summary(since)?, &tl.probes_of("exit", since)?, &spans);
+        // 锁住的次数和总时长按锁住的时段算，以用户代理在运行的时间为上限
+        let by_hour = report::by_hour_of_day(since, now, offset, &observed, &spans, &times);
+        s.set_locks(now, &events, &spans, &by_hour, horizon);
+        Ok((summary_json(&s), by_hour))
     };
     let recent: Vec<Value> = rows7.iter().rev().take(LIST_MAX).map(disconnect_json).collect();
     let events: Vec<Value> = events8
@@ -438,14 +453,12 @@ pub fn history(tl: &Timeline, now: i64) -> Result<Value> {
             json!({ "time": local_time(e.ts), "label": label, "text": text })
         })
         .collect();
-    // 按钟点看这 7 天：一天里什么时候最容易锁住
-    let offset = local_offset_ms();
-    let times: Vec<i64> = rows7.iter().map(|r| r.ts).collect();
-    let by_hour = report::by_hour_of_day(now - 7 * day, now, offset, &tl.observed_minutes(now - 7 * day, offset)?, &spans, &times);
+    // 7 天那一份按钟点的汇总，同时用来画“按钟点看”
+    let (week, by_hour) = period(7 * day)?;
     Ok(json!({
-        "day": period(day)?,
-        "week": period(7 * day)?,
-        "hours": hours(now, &spans, &rows7),
+        "day": period(day)?.0,
+        "week": week,
+        "hours": hours(now, offset, &observed, horizon, &spans, &rows7),
         "by_hour": by_hour_json(&by_hour),
         "disconnects": recent,
         "events": events,
@@ -622,14 +635,30 @@ mod tests {
         // 一次锁住跨了两个小时：前一小时的最后 10 分钟，加这一小时的头 5 分钟
         let spans = [(100 * HOUR_MS - 600_000, 100 * HOUR_MS + 300_000), (50 * HOUR_MS, 50 * HOUR_MS + 1000)];
         let rows = [row(100 * HOUR_MS + 1), row(100 * HOUR_MS + 2), row(99 * HOUR_MS + 5), row(10 * HOUR_MS)];
-        let h = hours(now, &spans, &rows);
+        // 没有探测记录可比时（horizon 传 now）：锁了多久就是多久
+        let h = hours(now, 0, &[], now, &spans, &rows);
         assert_eq!(h.len(), 24);
         assert_eq!((h[23].start_ms, h[23].locked_s, h[23].disconnects), (100 * HOUR_MS, 300, 2));
         assert_eq!((h[22].locked_s, h[22].disconnects), (600, 1));
         assert_eq!(h.iter().map(|x| x.locked_s).sum::<u64>(), 900, "24 小时以外的不算");
         // 还锁着：只算到现在
-        let h = hours(now, &[(100 * HOUR_MS + 20 * 60_000, i64::MAX)], &[]);
+        let h = hours(now, 0, &[], now, &[(100 * HOUR_MS + 20 * 60_000, i64::MAX)], &[]);
         assert_eq!(h[23].locked_s, 600);
+
+        // 有探测记录时：一小时里锁住的时间不超过用户代理在运行的时间。
+        // 第 97 小时锁住后电脑睡了，第 99 小时醒来：睡着的第 98 小时不算，第 97 小时只运行了 20 分钟
+        let asleep = [(97 * HOUR_MS + 10 * 60_000, 99 * HOUR_MS + 5 * 60_000)];
+        let observed = [(97, 20), (99, 60), (100, 30)];
+        let h = hours(now, 0, &observed, 0, &asleep, &[]);
+        assert_eq!((h[20].locked_s, h[21].locked_s, h[22].locked_s), (20 * 60, 0, 5 * 60));
+        // 探测明细留不到那么早的小时（horizon 之前）不设上限
+        let h = hours(now, 0, &observed, 99 * HOUR_MS, &asleep, &[]);
+        assert_eq!((h[20].locked_s, h[21].locked_s, h[22].locked_s), (50 * 60, 60 * 60, 5 * 60));
+        // 小时按本机时区的整点分：东 5 区半，整点落在 UTC 的半点上
+        let off = 5 * HOUR_MS + 30 * 60_000;
+        let h = hours(now, off, &[], now, &[], &[]);
+        assert_eq!((h[23].start_ms + off) % HOUR_MS, 0);
+        assert!(h[23].start_ms <= now && now - h[23].start_ms < HOUR_MS);
     }
 
     /// 手动跑：对着一份真实的时间线（只读）算一遍统计，看要多久。

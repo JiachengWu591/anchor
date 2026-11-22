@@ -156,10 +156,14 @@ impl Timeline {
     }
 
     pub fn probe(&self, segment: &str, target: &str, ok: bool, ms: Option<u64>, note: &str) {
+        self.probe_at(now_ms(), segment, target, ok, ms, note);
+    }
+
+    pub fn probe_at(&self, ts: i64, segment: &str, target: &str, ok: bool, ms: Option<u64>, note: &str) {
         let r = self.with(|c| {
             c.execute(
                 "INSERT INTO probes (ts, segment, target, ok, ms, note) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![now_ms(), segment, target, ok, ms.map(|m| m as i64), note],
+                params![ts, segment, target, ok, ms.map(|m| m as i64), note],
             )
         });
         if let Err(e) = r {
@@ -254,6 +258,11 @@ impl Timeline {
             })?;
             Ok(rows.filter_map(|r| r.ok()).collect())
         })
+    }
+
+    /// 还留着的最早一条探测的时间。探测明细只保留 7 天：比它更早的时候，没法知道用户代理在不在运行。
+    pub fn oldest_probe(&self) -> Result<Option<i64>> {
+        self.with(|c| c.query_row("SELECT MIN(ts) FROM probes", [], |r| r.get::<_, Option<i64>>(0)))
     }
 
     /// since 以来每个“本地小时”里有探测记录的分钟数：(本地小时序号, 分钟数)。
@@ -545,6 +554,9 @@ mod tests {
         assert!(matches!(seen.len(), 1 | 2) && seen.iter().map(|x| x.1).sum::<u32>() <= 2, "{seen:?}");
         assert!(seen.iter().all(|x| (x.0 - now.div_euclid(3_600_000)).abs() <= 1), "{seen:?}");
         assert!(t.observed_minutes(now + 60_000, 0).unwrap().is_empty());
+        t.probe_at(now - 3 * 3_600_000, "lan", "wifi", true, Some(2), "");
+        assert_eq!(t.oldest_probe().unwrap(), Some(now - 3 * 3_600_000));
+        assert_eq!(Timeline::memory().unwrap().oldest_probe().unwrap(), None);
         assert!(t.probes_between(0, 1_000).unwrap().is_empty());
 
         // 断联和事件一样保留 90 天

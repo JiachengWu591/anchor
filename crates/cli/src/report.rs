@@ -21,11 +21,14 @@ pub fn run(paths: &Paths, since: Duration, list: bool, json: bool) -> Result<()>
     let exit_checks = tl.probes_of("exit", since_ms)?;
     // 锁住可能开始于报告起点之前：多取一天的事件来推算锁住时段
     let spans = lock_spans(&tl.events_since(since_ms - 86_400_000, &[], usize::MAX)?, now_ms());
-    let s = summarize(since_ms, &rows, &events, &probes, &exit_checks, &spans);
+    let mut s = summarize(since_ms, &rows, &events, &probes, &exit_checks, &spans);
     // 按钟点看：一天里什么时候最容易锁住
     let offset = local_offset_ms();
     let times: Vec<i64> = rows.iter().map(|r| r.ts).collect();
-    let hours = by_hour_of_day(since_ms, now_ms(), offset, &tl.observed_minutes(since_ms, offset)?, &spans, &times);
+    let now = now_ms();
+    let hours = by_hour_of_day(since_ms, now, offset, &tl.observed_minutes(since_ms, offset)?, &spans, &times);
+    // 锁住的次数和总时长按锁住的时段算，以用户代理在运行的时间为上限
+    s.set_locks(now, &events, &spans, &hours, tl.oldest_probe()?.unwrap_or(now));
     if json {
         let v = serde_json::json!({
             "summary": s,
