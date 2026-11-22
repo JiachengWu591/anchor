@@ -25,6 +25,9 @@ pub const MERGE_MS: i64 = 5_000;
 pub const WINDOW_BEFORE_MS: i64 = 30_000;
 pub const WINDOW_AFTER_MS: i64 = 15_000;
 const PROBE_BEFORE_MS: i64 = 10_000;
+/// 探测第一次失败、隔半秒重试才成功时，说明里带这几个字（用户代理的探测写，归因读）。
+/// 这样的探测算成功，但它说明那一刻这一段在丢包。
+pub const RETRIED: &str = "重试后成功";
 
 /// 一行 sing-box 日志。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -416,12 +419,41 @@ pub fn attribute(d: &Disconnect, probes: &[Probe], events: &[Event], has_lines: 
     if let Some(p) = probes.iter().find(|p| in_win(p.ts) && p.segment == "status" && !p.ok) {
         return v(Cause::Service, format!("{} 官方状态页报告故障：{}", p.target, p.note));
     }
-    // 6. 探测都没指出问题时，按错误本身判断：这两类是出口一侧报的错
+    // 6. 各段探测都通，但通得勉强：断联那一刻（和探测失败同一个时间范围）有探测要重试才成功。
+    // 实测：VPN 丢包时，单次连接超时前后的探测多半就是这样，只看成败会全部算成“各段正常”。
+    // 排在前面各条之后：有明确故障的仍按明确的算。由近到远，和第 2 步一样
+    let retried = |seg: &str| probes.iter().filter(|p| near(p.ts) && p.segment == seg && p.ok && p.note.contains(RETRIED)).count();
+    let n = retried("lan");
+    if n > 0 {
+        return v(Cause::Local, format!("路由器的探测有 {n} 次要重试才成功：Wi-Fi 或网线不稳"));
+    }
+    let n = retried("wan");
+    if n > 0 {
+        return v(Cause::Local, format!("绕开 VPN 上网的探测有 {n} 次要重试才成功：宽带不稳"));
+    }
+    let n = retried("local");
+    if n > 0 {
+        if vpn_suspect {
+            return v(Cause::Vpn, format!("Wi-Fi 和宽带正常（绕开 VPN 能上网），经 VPN 上网的探测有 {n} 次要重试才成功：VPN 隧道在丢包"));
+        }
+        return v(Cause::Local, format!("本机上网的探测有 {n} 次要重试才成功：本地网络不稳"));
+    }
+    let n = retried("chain");
+    if n > 0 {
+        return v(Cause::Exit, format!("整条链路的探测有 {n} 次要重试才成功：出口这条路在丢包"));
+    }
+    // 7. 探测都没指出问题时，按错误本身判断：这两类是出口一侧报的错
     if d.class == ErrClass::Rejected {
         return v(Cause::Exit, "出口（或上游代理）拒绝了这次连接，各段探测正常：多半是一时的".into());
     }
     if d.class == ErrClass::Dns {
         return v(Cause::Exit, "经出口的 DNS 解析失败，各段探测正常：多半是一时的".into());
+    }
+    // 8. 经出口拨号超时，可前后经出口访问同一个域名是通的：一次连接丢了包。本机网络和服务端都排除了，
+    // 剩下出口这条路（出口绑在 VPN 上时包括 VPN 隧道），分不出更细。没有这个域名的探测结果时不下结论
+    if d.class == ErrClass::Timeout && d.phase == "open" && probes.iter().any(|p| in_win(p.ts) && p.segment == "ai" && p.target == d.domain && p.ok) {
+        let where_ = if has_vpn { "在 VPN 隧道里，或者在出口到 AI 服务之间" } else { "在出口到 AI 服务之间" };
+        return v(Cause::Exit, format!("连接超时了一次，前后经出口访问 {} 是通的，各段探测也正常：一时的丢包，{where_}", d.domain));
     }
     v(Cause::Unknown, "各段探测都正常".into())
 }
@@ -688,6 +720,103 @@ mod tests {
         let v = attribute(&d, &status, &[], false);
         assert_eq!(v.cause, Cause::Service);
         assert!(v.why.contains("Major Outage"));
+    }
+
+    #[test]
+    fn shaky_probes_and_one_off_timeouts_are_not_unknown() {
+        let t = 100_000;
+        let d = dc(ErrClass::Timeout);
+        let retried = |ts: i64, seg: &str, target: &str| Probe { note: format!("突发：{RETRIED}；第一次：Network Error"), ..probe(ts, seg, target, true) };
+        let normal = vec![probe(t - 8_000, "lan", "wifi", true), probe(t - 8_000, "wan", "wifi", true), probe(t - 8_000, "local", "vpn", true)];
+        let with = |extra: Vec<Probe>| [normal.clone(), extra].concat();
+
+        // 都正常，也没有这个域名的探测：还是未知
+        assert_eq!(attribute(&d, &normal, &[], false).cause, Cause::Unknown);
+
+        // 经 VPN 的探测要重试才成功：VPN 在丢包（真机 11-21 的那一串超时多半是这样）
+        let v = attribute(&d, &with(vec![retried(t + 4_000, "local", "vpn")]), &[], false);
+        assert_eq!(v.cause, Cause::Vpn);
+        assert_eq!(v.why, "Wi-Fi 和宽带正常（绕开 VPN 能上网），经 VPN 上网的探测有 1 次要重试才成功：VPN 隧道在丢包");
+        // 没有 VPN，或者绕开 VPN 那一段没有数据：只能说本地
+        let no_wan = vec![probe(t - 8_000, "lan", "wifi", true), retried(t + 4_000, "local", "vpn")];
+        assert_eq!(attribute(&d, &no_wan, &[], false).cause, Cause::Local);
+        assert_eq!(attribute(&d, &[retried(t + 4_000, "local", "direct")], &[], false).cause, Cause::Local);
+        // 路由器、宽带的探测要重试：本地，由近到远
+        assert!(attribute(&d, &with(vec![retried(t + 1_000, "wan", "wifi"), retried(t + 4_000, "local", "vpn")]), &[], false).why.contains("宽带不稳"));
+        assert!(attribute(&d, &with(vec![retried(t - 2_000, "lan", "wifi"), retried(t + 1_000, "wan", "wifi")]), &[], false).why.contains("Wi-Fi 或网线不稳"));
+
+        // 整条链路的探测要重试：出口这条路在丢包
+        let v = attribute(&d, &with(vec![retried(t - 5_000, "chain", "exit")]), &[], false);
+        assert_eq!((v.cause, v.why.as_str()), (Cause::Exit, "整条链路的探测有 1 次要重试才成功：出口这条路在丢包"));
+        // 和探测失败一样，只看断联前 10 秒到之后 15 秒：更早、更晚的不算到这一次头上
+        let outside = with(vec![retried(t - 20_000, "local", "vpn"), retried(t - 13_000, "chain", "exit"), retried(t + 16_000, "local", "vpn")]);
+        assert_eq!(attribute(&d, &outside, &[], false).cause, Cause::Unknown);
+        // 断联那一刻明确失败的，仍按原来的说法
+        let v = attribute(&d, &with(vec![probe(t - 3_000, "chain", "exit", false), retried(t + 4_000, "local", "vpn")]), &[], false);
+        assert_eq!(v.why, "整条链路探测失败 1 次");
+
+        // 孤立的一次超时：前后经出口访问同一个域名是通的
+        let v = attribute(&d, &with(vec![probe(t + 2_000, "ai", "claude.ai", true)]), &[], false);
+        assert_eq!(v.cause, Cause::Exit);
+        assert_eq!(v.why, "连接超时了一次，前后经出口访问 claude.ai 是通的，各段探测也正常：一时的丢包，在 VPN 隧道里，或者在出口到 AI 服务之间");
+        let no_vpn = vec![probe(t - 8_000, "local", "direct", true), probe(t + 2_000, "ai", "claude.ai", true)];
+        assert!(attribute(&d, &no_vpn, &[], false).why.ends_with("一时的丢包，在出口到 AI 服务之间"));
+        // 探测的是别的域名、这个域名不通、或者不是拨号超时：不套这一条
+        assert_eq!(attribute(&d, &with(vec![probe(t + 2_000, "ai", "api.anthropic.com", true)]), &[], false).cause, Cause::Unknown);
+        assert_eq!(attribute(&d, &with(vec![probe(t + 2_000, "ai", "claude.ai", false)]), &[], false).cause, Cause::Service);
+        assert_eq!(attribute(&dc(ErrClass::Reset), &with(vec![probe(t + 2_000, "ai", "claude.ai", true)]), &[], false).cause, Cause::Unknown);
+        let relay = Disconnect { phase: "relay", ..dc(ErrClass::Timeout) };
+        assert_eq!(attribute(&relay, &with(vec![probe(t + 2_000, "ai", "claude.ai", true)]), &[], false).cause, Cause::Unknown);
+        // DNS 失败时 VPN 在丢包：说 VPN，不说“多半是一时的”
+        assert_eq!(attribute(&dc(ErrClass::Dns), &with(vec![retried(t + 4_000, "local", "vpn")]), &[], false).cause, Cause::Vpn);
+    }
+
+    /// 手动跑：对着一份真实的时间线（只读），用现在的规则把最近 8 天没被锁住拦下的断联重新归因一遍，
+    /// 和当时记下的归因比较，结果写进 ANCHOR_OUT 指的文件。改归因规则时用它看影响面。
+    /// `ANCHOR_TIMELINE=<timeline.db> ANCHOR_OUT=<文件> cargo test -p anchor-core --features timeline reattribute -- --ignored`
+    #[test]
+    #[ignore]
+    fn reattribute_a_real_timeline() {
+        use crate::timeline::{Timeline, local_time, now_ms};
+        use std::collections::BTreeMap;
+        let (Some(db), Some(out)) = (std::env::var_os("ANCHOR_TIMELINE"), std::env::var_os("ANCHOR_OUT")) else { return };
+        let tl = Timeline::open_read_only(std::path::Path::new(&db)).unwrap();
+        let classes = [
+            ErrClass::Dns,
+            ErrClass::Unreachable,
+            ErrClass::Timeout,
+            ErrClass::Refused,
+            ErrClass::Rejected,
+            ErrClass::Reset,
+            ErrClass::Tls,
+            ErrClass::Other,
+        ];
+        let mut moved: BTreeMap<(String, String), usize> = BTreeMap::new();
+        let mut lines = Vec::new();
+        let (mut total, mut skipped) = (0, 0);
+        for r in tl.disconnects_since(now_ms() - 8 * 86_400_000).unwrap() {
+            // 锁住拦下的要有锁住的起止时间才能归因，记录里没有：不重算
+            let Some(class) = classes.iter().copied().find(|c| c.name() == r.class) else {
+                skipped += 1;
+                continue;
+            };
+            total += 1;
+            let phase = if r.phase == "relay" { "relay" } else { "open" };
+            let d = Disconnect { ts: r.ts, domain: r.domain.clone(), phase, class, outbound: r.outbound.clone(), raw: String::new(), count: r.count, lock: None };
+            let probes = tl.probes_between(r.ts - WINDOW_BEFORE_MS, r.ts + WINDOW_AFTER_MS).unwrap();
+            let events = tl.events_between(r.ts - WINDOW_BEFORE_MS, r.ts + WINDOW_AFTER_MS).unwrap();
+            let v = attribute(&d, &probes, &events, false);
+            *moved.entry((r.cause.clone(), v.cause.name().to_string())).or_default() += 1;
+            if r.cause != v.cause.name() {
+                lines.push(format!("{}  {}  {}  {} -> {}  {}", local_time(r.ts), r.domain, ErrClass::label(&r.class), r.cause, v.cause.name(), v.why));
+            }
+        }
+        let mut text = format!("re-attributed {total} disconnects (skipped {skipped} intercepted during a lock)\n");
+        for ((from, to), n) in &moved {
+            text.push_str(&format!("  {from:>8} -> {to:<8} {n}\n"));
+        }
+        text.push_str(&lines.join("\n"));
+        std::fs::write(out, text + "\n").unwrap();
     }
 
     #[test]

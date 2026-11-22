@@ -235,7 +235,7 @@ fn twice(mut f: impl FnMut() -> (bool, Option<u64>, String)) -> (bool, Option<u6
     }
     thread::sleep(Duration::from_millis(500));
     let second = f();
-    if second.0 { (true, second.1, format!("重试后成功；第一次：{}", first.2)) } else { second }
+    if second.0 { (true, second.1, format!("{}；第一次：{}", anchor_core::disconnect::RETRIED, first.2)) } else { second }
 }
 
 /// 不经代理访问连通性检测地址：(成功, 毫秒, 说明)。
