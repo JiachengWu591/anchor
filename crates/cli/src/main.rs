@@ -14,6 +14,7 @@ mod report;
 mod sandbox;
 mod svcctl;
 mod timeline;
+mod upgrade;
 
 pub use anchor_core::{apps, config, guard, ipc, kernel, net, netenv, ps, rules, singbox, util, watch, win};
 
@@ -171,6 +172,17 @@ enum Cmd {
     },
     /// 把被 MSIX 应用（如 Claude 桌面版）重定向到其私有目录的数据目录副本合并回原位置
     Repair,
+    /// 把新编译的程序换进安装目录：需要时重启用户代理，没启动成功就换回原来的
+    Upgrade {
+        /// 新编译的程序所在目录；不写就是本程序所在的目录（直接运行新编译出来的 anchor.exe upgrade）
+        dir: Option<PathBuf>,
+        /// 安装目录；不写时按运行中的用户代理、登录自启的设置来找
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// 只看会做什么，不改动
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -283,6 +295,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Launch { .. }
             | Cmd::Browser { .. }
             | Cmd::Repair
+            | Cmd::Upgrade { dry_run: false, .. }
             | Cmd::Agent { action: AgentCmd::Start | AgentCmd::Install | AgentCmd::Uninstall }
     )
 }
@@ -363,6 +376,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Shortcut { target, dir } => launch::create_shortcut(&paths, &target, dir.as_deref())?,
         Cmd::Rules { format } => rules::print(&format)?,
         Cmd::Repair => sandbox::repair(&paths)?,
+        Cmd::Upgrade { dir, to, dry_run } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run })?,
     }
     Ok(0)
 }
