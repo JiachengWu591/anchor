@@ -111,6 +111,12 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// 打开面板：AI 通道的状态、卡在哪一段、最近的断联（和点托盘图标一样）
+    Panel {
+        /// 不打开窗口，只输出面板的地址（带一次性的入场券，60 秒内有效）
+        #[arg(long)]
+        print: bool,
+    },
     /// 扫描本机已安装的 AI 程序
     Scan,
     /// 出口：核对与锁定
@@ -312,6 +318,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Up => up(&paths)?,
         Cmd::Status => status(&paths)?,
         Cmd::Report { since, list, json } => report::run(&paths, since.into(), list, json)?,
+        Cmd::Panel { print } => agentctl::panel(print)?,
         Cmd::Timeline { since, kind, probes, limit, json } => {
             timeline::print(&paths, &timeline::Query { since: since.into(), kinds: kind, probes, limit, json })?
         }

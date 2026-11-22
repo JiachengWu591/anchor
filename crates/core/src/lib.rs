@@ -16,6 +16,8 @@ pub mod net;
 pub mod netenv;
 pub mod netwatch;
 pub mod ps;
+#[cfg(feature = "timeline")]
+pub mod report;
 pub mod rules;
 pub mod singbox;
 pub mod stall;

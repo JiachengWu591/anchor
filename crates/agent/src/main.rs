@@ -3,12 +3,14 @@
 //! 守护 sing-box、线路看门狗、时间线、系统通知；向特权服务查询守卫状态。不改防火墙。
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod actions;
 mod api;
 mod disconnects;
 mod exitguard;
 mod guardpoll;
 mod health;
 mod lines;
+mod panel;
 mod session;
 mod shared;
 mod tray;

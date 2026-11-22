@@ -90,6 +90,8 @@ pub struct Shared {
     pub lines_view: Mutex<Option<serde_json::Value>>,
     /// 本机网络各段探测的最新结果（持续探测写，出口迟迟连不上时用它判断卡在哪一段）
     health: Mutex<LocalHealth>,
+    /// 面板的本机网页服务：用到时才启动
+    pub panel: crate::panel::Panel,
     st: Mutex<Status>,
     notes: Mutex<VecDeque<Note>>,
     stop_reason: Mutex<String>,
@@ -114,6 +116,7 @@ impl Shared {
             line_kick: AtomicBool::new(false),
             lines_view: Mutex::new(None),
             health: Mutex::new(LocalHealth::default()),
+            panel: crate::panel::Panel::default(),
             st: Mutex::new(st),
             notes: Mutex::new(VecDeque::new()),
             stop_reason: Mutex::new(String::new()),

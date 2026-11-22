@@ -3,6 +3,7 @@
 //! status：运行状态；reload：重新读取配置并重启内核；stop：退出；event：记录命令行发起的事件（目前只有 app_launch）；
 //! exit.recheck：先锁住 AI 通道，立即核对出口（与网络变化时的处理相同）。
 //! line.list：各线路的评分；line.use / line.pin / line.unpin：手动换线、固定、取消固定（交给线路控制器）。
+//! panel.open：打开面板窗口；panel.url：只给出打开面板的地址（带一次性入场券）。
 
 use crate::lines::LineCmd;
 use crate::shared::Shared;
@@ -42,6 +43,11 @@ fn dispatch(sh: &Arc<Shared>, req: &Request) -> Result<Value> {
             sh.poke();
             Ok(json!({ "rechecking": true }))
         }
+        "panel.open" => {
+            sh.panel.open(sh)?;
+            Ok(json!({ "opened": true }))
+        }
+        "panel.url" => Ok(json!({ "url": sh.panel.url(sh)? })),
         "line.list" => lines_view(sh),
         "line.use" => line_cmd(sh, LineCmd::Use(name(req)?)),
         "line.pin" => line_cmd(sh, LineCmd::Pin(name(req)?)),

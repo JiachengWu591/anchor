@@ -235,6 +235,27 @@ impl Timeline {
         })
     }
 
+    /// since 以来每一段最近的一次探测（面板画“现在各段通不通”用）。
+    pub fn last_probes(&self, since: i64) -> Result<Vec<Probe>> {
+        self.with(|c| {
+            let mut st = c.prepare(
+                "SELECT ts, segment, target, ok, ms, note FROM probes \
+                 WHERE id IN (SELECT MAX(id) FROM probes WHERE ts >= ?1 GROUP BY segment) ORDER BY segment",
+            )?;
+            let rows = st.query_map(params![since], |r| {
+                Ok(Probe {
+                    ts: r.get(0)?,
+                    segment: r.get(1)?,
+                    target: r.get(2)?,
+                    ok: r.get(3)?,
+                    ms: r.get::<_, Option<i64>>(4)?.map(|m| m as u64),
+                    note: r.get(5)?,
+                })
+            })?;
+            Ok(rows.filter_map(|r| r.ok()).collect())
+        })
+    }
+
     /// [from, to] 之间的探测，按时间正序（归因用）。
     pub fn probes_between(&self, from: i64, to: i64) -> Result<Vec<Probe>> {
         self.with(|c| {
@@ -497,6 +518,12 @@ mod tests {
         t.probe("local", "direct", true, Some(10), "");
         let now = now_ms();
         assert_eq!(t.probes_between(now - 60_000, now + 1_000).unwrap().len(), 1);
+        // 每段只要最近的一次
+        t.probe("local", "vpn", false, None, "超时");
+        t.probe("lan", "wifi", true, Some(3), "");
+        let last = t.last_probes(now - 60_000).unwrap();
+        assert_eq!(last.iter().map(|p| (p.segment.as_str(), p.target.as_str(), p.ok)).collect::<Vec<_>>(), [("lan", "wifi", true), ("local", "vpn", false)]);
+        assert!(t.last_probes(now + 60_000).unwrap().is_empty());
         assert!(t.probes_between(0, 1_000).unwrap().is_empty());
 
         // 断联和事件一样保留 90 天

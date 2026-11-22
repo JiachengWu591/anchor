@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>AI Anchor</title>
+<link rel="icon" href="/icon.svg">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<main id="app" hidden>
+  <section id="channel" class="channel" data-state="verifying" aria-live="polite">
+    <div class="channel-head">
+      <span class="lamp" aria-hidden="true"></span>
+      <div class="channel-text">
+        <h1 id="ch-title">正在读取状态</h1>
+        <p id="ch-detail"></p>
+      </div>
+      <span id="ch-timer" class="timer" hidden></span>
+    </div>
+    <p id="ch-advice" class="advice" hidden></p>
+  </section>
+
+  <section class="card">
+    <h2>从这台电脑到 AI 服务</h2>
+    <ol id="path" class="path"></ol>
+  </section>
+
+  <section class="actions" aria-label="操作">
+    <button type="button" data-action="recheck">立即核对出口</button>
+    <button type="button" data-action="check">运行体检</button>
+    <button type="button" data-action="reload">重新加载配置</button>
+  </section>
+  <p id="toast" class="toast" role="status" hidden></p>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>断联与锁住</h2>
+      <div class="tabs">
+        <button type="button" id="tab-day" class="on" aria-pressed="true">24 小时</button>
+        <button type="button" id="tab-week" aria-pressed="false">7 天</button>
+      </div>
+    </div>
+    <div id="stats" class="stats"></div>
+    <div id="causes" class="causes"></div>
+    <p id="more" class="more"></p>
+    <div id="hours-wrap">
+      <h3>最近 24 小时，每小时锁住多久</h3>
+      <div id="hours" class="hours"></div>
+      <div id="hours-axis" class="hours-axis"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>最近的断联</h2>
+      <button type="button" class="link" data-action="report">完整报告</button>
+    </div>
+    <ul id="disconnects" class="list"></ul>
+  </section>
+
+  <details class="card">
+    <summary>最近 24 小时的事件</summary>
+    <ul id="events" class="list events"></ul>
+    <button type="button" class="link" data-action="timeline">完整时间线</button>
+  </details>
+
+  <details class="card">
+    <summary>运行信息</summary>
+    <dl id="facts" class="facts"></dl>
+    <button type="button" class="link" data-action="folder">打开数据目录</button>
+  </details>
+</main>
+
+<section id="gate" class="gate" hidden>
+  <img src="/icon.svg" alt="" width="48" height="48">
+  <h1>AI Anchor</h1>
+  <p id="gate-text"></p>
+</section>
+
+<script src="/app.js"></script>
+</body>
+</html>
