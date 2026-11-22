@@ -303,6 +303,12 @@ details .link { margin-top: 8px; }
 .hours { display: flex; align-items: flex-end; gap: 2px; height: 44px; border-bottom: 1px solid var(--line); }
 .hours span { flex: 1; min-width: 0; height: 0; border-radius: 2px 2px 0 0; background: var(--fail); }
 .hours span.none { height: 2px; background: var(--line); border-radius: 0; }
+#byhour-wrap { margin-top: 14px; }
+/* 按钟点：满高表示每天都锁住过；没看到过的钟点画成虚的 */
+.byhour span { background: var(--c-vpn); }
+.byhour span.unseen { height: 2px; background: none; border-top: 2px dotted var(--faint); border-radius: 0; }
+#byhour-text { margin-top: 6px; }
+
 .hours-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--faint); margin-top: 2px; font-variant-numeric: tabular-nums; }
 
 /* ---- 列表 ---- */

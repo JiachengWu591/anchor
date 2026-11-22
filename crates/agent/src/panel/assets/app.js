@@ -190,6 +190,28 @@ function renderHours(hours) {
   });
 }
 
+// 按钟点：每个钟点一根，满高表示看到的每一天都锁住过
+function renderByHour(b) {
+  const box = $('byhour');
+  const axis = $('byhour-axis');
+  box.replaceChildren();
+  axis.replaceChildren();
+  b.hours.forEach((h, i) => {
+    const bar = el('span');
+    if (h.days === 0) {
+      bar.className = 'unseen';
+    } else if (h.days_locked > 0) {
+      bar.style.height = Math.max(10, Math.round(h.share * 100)) + '%';
+    } else {
+      bar.className = 'none';
+    }
+    bar.title = h.tip;
+    box.append(bar);
+    if (i % 6 === 0 || i === b.hours.length - 1) axis.append(el('span', '', h.label + ' 点'));
+  });
+  $('byhour-text').textContent = b.text;
+}
+
 function renderDisconnects(rows) {
   const list = $('disconnects');
   list.replaceChildren();
@@ -232,6 +254,7 @@ function renderHistory() {
   if (!hist) return;
   renderSummary(period === 'day' ? hist.day : hist.week);
   renderHours(hist.hours);
+  renderByHour(hist.by_hour);
   renderDisconnects(hist.disconnects);
   renderEvents(hist.events);
 }

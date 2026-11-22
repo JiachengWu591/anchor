@@ -7,7 +7,7 @@ use crate::shared::{GuardView, KernelState, Status};
 use anchor_core::disconnect::{Cause, ErrClass};
 use anchor_core::report::{self, Summary};
 use anchor_core::stall::{self, NoticeCtx, Stuck};
-use anchor_core::timeline::{DisconnectRow, Event, Probe, Timeline, describe, local_time};
+use anchor_core::timeline::{DisconnectRow, Event, Probe, Timeline, describe, local_offset_ms, local_time};
 use anchor_core::util::zh_duration;
 use anyhow::Result;
 use serde::Serialize;
@@ -369,6 +369,35 @@ pub fn hours(now: i64, spans: &[(i64, i64)], rows: &[DisconnectRow]) -> Vec<Hour
         .collect()
 }
 
+/// 按钟点的条形图：每个钟点一根，高度是“看到的天数里有几成锁住过”。
+fn by_hour_json(hours: &[report::HourOfDay]) -> Value {
+    let bars: Vec<Value> = hours
+        .iter()
+        .map(|h| {
+            let tip = if h.days == 0 {
+                format!("{:02} 点：这 7 天里用户代理没有在这个钟点运行过", h.hour)
+            } else {
+                format!(
+                    "{:02} 点：{} 天里有 {} 天锁住过，共锁住 {}，断联 {} 次",
+                    h.hour,
+                    h.days,
+                    h.days_locked,
+                    zh_duration(h.locked_ms / 1000),
+                    h.disconnects
+                )
+            };
+            json!({
+                "label": format!("{:02}", h.hour),
+                "days": h.days,
+                "days_locked": h.days_locked,
+                "share": if h.days == 0 { 0.0 } else { f64::from(h.days_locked) / f64::from(h.days) },
+                "tip": tip,
+            })
+        })
+        .collect();
+    json!({ "hours": bars, "text": report::hours_summary(hours) })
+}
+
 fn disconnect_json(r: &DisconnectRow) -> Value {
     json!({
         "time": local_time(r.ts),
@@ -409,10 +438,15 @@ pub fn history(tl: &Timeline, now: i64) -> Result<Value> {
             json!({ "time": local_time(e.ts), "label": label, "text": text })
         })
         .collect();
+    // 按钟点看这 7 天：一天里什么时候最容易锁住
+    let offset = local_offset_ms();
+    let times: Vec<i64> = rows7.iter().map(|r| r.ts).collect();
+    let by_hour = report::by_hour_of_day(now - 7 * day, now, offset, &tl.observed_minutes(now - 7 * day, offset)?, &spans, &times);
     Ok(json!({
         "day": period(day)?,
         "week": period(7 * day)?,
         "hours": hours(now, &spans, &rows7),
+        "by_hour": by_hour_json(&by_hour),
         "disconnects": recent,
         "events": events,
     }))
@@ -655,5 +689,20 @@ mod tests {
         assert_eq!(d[1]["raw"].as_str(), Some("dial tcp: i/o timeout"));
         let e = h["events"].as_array().unwrap();
         assert_eq!((e.len(), e[0]["label"].as_str()), (2, Some("出口放行")));
+        // 按钟点：这份时间线里没有探测记录，所以哪个钟点都没看到
+        let bars = h["by_hour"]["hours"].as_array().unwrap();
+        assert_eq!((bars.len(), bars[7]["label"].as_str(), bars[7]["days"].as_u64()), (24, Some("07"), Some(0)));
+        assert_eq!(h["by_hour"]["text"].as_str(), Some("没有哪个钟点在两天以上锁住过，看不出高峰时段"));
+    }
+
+    #[test]
+    fn by_hour_bars_say_how_many_days_were_locked() {
+        let mut hours: Vec<report::HourOfDay> = (0..24).map(|hour| report::HourOfDay { hour, ..Default::default() }).collect();
+        hours[19] = report::HourOfDay { hour: 19, days: 6, days_locked: 4, observed_ms: 6 * 3_600_000, locked_ms: 42 * 60_000, disconnects: 31 };
+        let v = by_hour_json(&hours);
+        assert_eq!(v["hours"][19]["tip"].as_str(), Some("19 点：6 天里有 4 天锁住过，共锁住 42 分，断联 31 次"));
+        assert_eq!(v["hours"][19]["share"].as_f64().map(|x| (x * 100.0).round()), Some(67.0));
+        assert_eq!(v["hours"][3]["tip"].as_str(), Some("03 点：这 7 天里用户代理没有在这个钟点运行过"));
+        assert_eq!(v["text"].as_str(), Some("最容易锁住的钟点：19 点（6 天里有 4 天锁住过，共 42 分）"));
     }
 }
