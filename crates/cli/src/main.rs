@@ -172,7 +172,7 @@ enum Cmd {
     },
     /// 把被 MSIX 应用（如 Claude 桌面版）重定向到其私有目录的数据目录副本合并回原位置
     Repair,
-    /// 把新编译的程序换进安装目录：需要时重启用户代理，没启动成功就换回原来的
+    /// 把新编译的程序换进安装目录：需要时重启用户代理，没启动成功就换回原来的。换下来的那一版留着，--rollback 退回
     Upgrade {
         /// 新编译的程序所在目录；不写就是本程序所在的目录（直接运行新编译出来的 anchor.exe upgrade）
         dir: Option<PathBuf>,
@@ -185,6 +185,9 @@ enum Cmd {
         /// 特权服务也一起更新（弹出管理员确认）；新的没启动成功就换回原来的
         #[arg(long)]
         service: bool,
+        /// 退回上一版：把上次升级换下来的那一版（安装目录的 previous\ 里）换回去；再运行一次就换回来
+        #[arg(long, conflicts_with = "dir")]
+        rollback: bool,
     },
 }
 
@@ -382,7 +385,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Shortcut { target, dir } => launch::create_shortcut(&paths, &target, dir.as_deref())?,
         Cmd::Rules { format } => rules::print(&format)?,
         Cmd::Repair => sandbox::repair(&paths)?,
-        Cmd::Upgrade { dir, to, dry_run, service } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service })?,
+        Cmd::Upgrade { dir, to, dry_run, service, rollback } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service, rollback })?,
     }
     Ok(0)
 }

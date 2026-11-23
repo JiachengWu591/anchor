@@ -7,6 +7,10 @@
 //! - 正在运行的程序可以改名，不能覆盖：所以用安装目录里的 anchor.exe 升级它自己也行，
 //!   它的旧文件留到下次升级时再删。
 //!
+//! 换下来的那一版留在安装目录的 previous\ 里（三个程序的完整一份，外加一个记着“换上去的是哪一版”的小文件）。
+//! anchor upgrade --rollback 就是从 previous\ 再升级一次：停、换、启动、起不来就换回，都是同一段代码；
+//! 换完之后 previous\ 里是刚才那一版，所以再运行一次就换回去。
+//!
 //! 特权服务默认不动：它装在 %ProgramFiles%，替换要管理员权限。加 --service 才一起更新，
 //! 做法是以管理员身份运行新编译的 anchor-svc.exe upgrade（见 svcctl::upgrade_from），那边自己负责停、换、启动和换回。
 
@@ -32,6 +36,12 @@ const REQUIRED: [&str; 2] = [CLI, AGENT];
 /// 有就一起带上的：安装目录里的这一份只是 anchor service install / upgrade 用的安装源。
 const OPTIONAL: [&str; 1] = [SVC];
 
+/// 升级时换下来的那一版放在安装目录的这个子目录里。
+const PREVIOUS: &str = "previous";
+/// previous\ 里的记号：换上去的那一版（文件名、大小、修改时间）。退回之前用它确认安装目录还是那一版。
+const MARK: &str = "replaced-by.txt";
+const MARK_HEADER: &str = "# anchor upgrade 留下的上一版。下面是换上去的那一版：文件名、大小、修改时间（毫秒）。\n# anchor upgrade --rollback 用它确认安装目录在那之后没有被别的方式改过。\n";
+
 const STOP_WAIT: Duration = Duration::from_secs(15);
 const START_WAIT: Duration = Duration::from_secs(15);
 
@@ -43,6 +53,8 @@ pub struct Args {
     pub dry_run: bool,
     /// 特权服务也一起更新（弹出管理员确认）
     pub service: bool,
+    /// 退回上一版：从安装目录的 previous\ 换回去
+    pub rollback: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +75,8 @@ struct Plan {
     from: PathBuf,
     to: PathBuf,
     items: Vec<Item>,
+    /// 这是退回上一版（from 是安装目录里的 previous）：只影响说法，做法一样
+    rollback: bool,
 }
 
 impl Plan {
@@ -119,6 +133,61 @@ fn resolve(here: &Path, dir: Option<&Path>, to: Option<&Path>, agent_dir: Option
     Ok((from, to))
 }
 
+fn names() -> impl Iterator<Item = &'static str> {
+    REQUIRED.into_iter().chain(OPTIONAL)
+}
+
+/// 退回上一版时的两个目录：安装目录里的 previous，和安装目录。
+/// 安装目录的找法和升级一样；都找不到时，本程序所在的目录里有 previous 就用它。
+fn resolve_rollback(here: &Path, to: Option<&Path>, agent_dir: Option<&Path>, autostart: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+    let here = here.join(PREVIOUS).is_dir().then_some(here);
+    let to = tidy(to.or(agent_dir).or(autostart).or(here).context(
+        "找不到安装目录：用户代理没有运行，也没有设置登录自启。用 --to 写明安装目录，例如 anchor upgrade --rollback --to <安装目录>",
+    )?);
+    Ok((to.join(PREVIOUS), to))
+}
+
+/// 一个目录里这几个程序的大小和修改时间，一行一个。复制时修改时间保留，所以同一版在哪里都是同一串。
+fn fingerprint(dir: &Path) -> String {
+    names()
+        .filter_map(|name| {
+            let m = std::fs::metadata(dir.join(name)).ok()?;
+            let ms = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+            Some(format!("{name}\t{}\t{ms}\n", m.len()))
+        })
+        .collect()
+}
+
+/// previous 能不能拿来退回：要完整，而且它记着的“换上去的那一版”就是安装目录里现在的这一版。
+/// 对不上说明 previous 不是现在这一版的上一版（留的时候出过错，或者安装目录后来被别的方式改过），退回去会装错。
+fn check_previous(prev: &Path, to: &Path) -> Result<()> {
+    if !prev.is_dir() {
+        bail!(
+            "{} 里没有留下上一版（没有 previous 目录）。上一版是 anchor upgrade 换文件时留下的：这个安装还没有用带这个功能的版本升级过",
+            to.display()
+        );
+    }
+    let by_hand = format!("确实要装 previous 里的那一份，可以把它当成新程序来升级：anchor upgrade \"{}\"", prev.display());
+    for name in REQUIRED {
+        if !prev.join(name).is_file() {
+            bail!("{} 里没有 {name}，上一版不完整，没有做任何改动。{by_hand}", prev.display());
+        }
+    }
+    let mark = std::fs::read_to_string(prev.join(MARK)).unwrap_or_default();
+    let recorded: String = mark.lines().filter(|l| !l.starts_with('#')).map(|l| format!("{l}\n")).collect();
+    if recorded.is_empty() {
+        bail!("{} 里没有 {MARK}：上次留上一版时没有留完，不能确定它是哪一版。没有做任何改动。{by_hand}", prev.display());
+    }
+    if recorded != fingerprint(to) {
+        bail!(
+            "{} 里的程序和上次升级换上去的不是同一版：上次升级之后，安装目录被别的方式改过（手工复制，或者用不带这个功能的版本升级过）。\
+             previous 里的不是现在这一版的上一版，没有做任何改动。{by_hand}",
+            to.display()
+        );
+    }
+    Ok(())
+}
+
 fn plan(from: &Path, to: &Path) -> Result<Plan> {
     for name in REQUIRED {
         if !from.join(name).is_file() {
@@ -129,7 +198,7 @@ fn plan(from: &Path, to: &Path) -> Result<Plan> {
         bail!("{} 里没有 anchor.exe，也没有 anchor-agent.exe：这不像是安装目录。第一次安装请手工复制", to.display());
     }
     let mut items = Vec::new();
-    for name in REQUIRED.into_iter().chain(OPTIONAL) {
+    for name in names() {
         let (src, dst) = (from.join(name), to.join(name));
         if !src.is_file() {
             continue;
@@ -143,12 +212,12 @@ fn plan(from: &Path, to: &Path) -> Result<Plan> {
         };
         items.push(Item { name, change });
     }
-    Ok(Plan { from: from.to_path_buf(), to: to.to_path_buf(), items })
+    Ok(Plan { from: from.to_path_buf(), to: to.to_path_buf(), items, rollback: false })
 }
 
 /// 删掉上次升级留下的 *.old 和没用上的 *.new。删不掉的（还在运行）留着。
 fn clear_leftovers(to: &Path) {
-    for name in REQUIRED.into_iter().chain(OPTIONAL) {
+    for name in names() {
         for suffix in [".old", ".new"] {
             let _ = std::fs::remove_file(with_suffix(to, name, suffix));
         }
@@ -161,22 +230,74 @@ fn remove_staged(plan: &Plan) {
     }
 }
 
+/// 复制一个文件，并核对复制的字节数。
+fn copy_whole(src: &Path, dst: &Path, name: &str) -> Result<()> {
+    let n = std::fs::copy(src, dst).with_context(|| format!("复制 {} 到 {} 失败", src.display(), dst.display()))?;
+    let want = std::fs::metadata(src)?.len();
+    if n != want { bail!("{name} 只复制了 {n} 字节，应为 {want} 字节") } else { Ok(()) }
+}
+
 /// 把要换的文件复制到安装目录里，名字后面加 .new。这一步不影响正在运行的程序；出错时不留下东西。
 fn stage(plan: &Plan) -> Result<()> {
     for i in plan.changed() {
         let (src, tmp) = (plan.from.join(i.name), with_suffix(&plan.to, i.name, ".new"));
-        let copied = std::fs::copy(&src, &tmp)
-            .with_context(|| format!("复制 {} 到 {} 失败", src.display(), tmp.display()))
-            .and_then(|n| {
-                let want = std::fs::metadata(&src)?.len();
-                if n != want { bail!("{} 只复制了 {n} 字节，应为 {want} 字节", i.name) } else { Ok(()) }
-            });
-        if let Err(e) = copied {
+        if let Err(e) = copy_whole(&src, &tmp, i.name) {
             remove_staged(plan);
             return Err(e);
         }
     }
     Ok(())
+}
+
+/// 把安装目录里现在的程序（三个都算，没变的也算）复制到 previous\ 里，名字后面加 .new。
+/// previous\ 里原有的那一版先不动：升级没成的话它还是有效的。出错时不留下东西。
+fn stage_previous(to: &Path) -> Result<()> {
+    let dir = to.join(PREVIOUS);
+    std::fs::create_dir_all(&dir).with_context(|| format!("建不了目录 {}", dir.display()))?;
+    clear_leftovers(&dir);
+    for name in names() {
+        let src = to.join(name);
+        if !src.is_file() {
+            continue;
+        }
+        if let Err(e) = copy_whole(&src, &with_suffix(&dir, name, ".new"), name) {
+            discard_previous(to);
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+/// 升级没有成：刚才复制的那一份不要了。previous\ 里原有的那一版照旧。
+fn discard_previous(to: &Path) {
+    let dir = to.join(PREVIOUS);
+    for name in names() {
+        let _ = std::fs::remove_file(with_suffix(&dir, name, ".new"));
+    }
+    // 空的才删得掉：原来就有上一版的话，目录留着
+    let _ = std::fs::remove_dir(&dir);
+}
+
+/// 升级成了：previous\ 换成刚才复制的那一份，并记下换上去的是哪一版。
+/// 先删记号、最后写记号：中途出错的话 previous\ 里没有记号，check_previous 不会拿它去退回。
+fn commit_previous(to: &Path) -> Result<()> {
+    let dir = to.join(PREVIOUS);
+    let mark = dir.join(MARK);
+    if mark.exists() {
+        std::fs::remove_file(&mark).with_context(|| format!("删不掉 {}", mark.display()))?;
+    }
+    for name in names() {
+        let (cur, new, old) = (dir.join(name), with_suffix(&dir, name, ".new"), with_suffix(&dir, name, ".old"));
+        if cur.exists() {
+            // 正在运行的程序也能改名（运行 previous\anchor.exe upgrade 时的它自己）；删不掉的 .old 下次再清
+            std::fs::rename(&cur, &old).with_context(|| format!("给 previous 里的 {name} 改名失败（有别的程序占着它？）"))?;
+        }
+        if new.exists() {
+            std::fs::rename(&new, &cur).with_context(|| format!("往 previous 里放 {name} 失败"))?;
+        }
+        let _ = std::fs::remove_file(&old);
+    }
+    std::fs::write(&mark, format!("{MARK_HEADER}{}", fingerprint(to))).with_context(|| format!("写不了 {}", mark.display()))
 }
 
 /// 换上新文件：旧的改名为 .old，.new 改成正式名字。中途出错就把已经换的换回去。
@@ -327,27 +448,51 @@ fn describe(plan: &Plan, i: &Item) -> String {
     match i.change {
         Change::Same => format!("  {name}没有变化"),
         Change::Add => format!("  {name}新增（编译于 {}）", built(&plan.from.join(i.name))),
-        Change::Replace => format!("  {name}更新（编译于 {} → {}）", built(&plan.to.join(i.name)), built(&plan.from.join(i.name))),
+        Change::Replace => format!(
+            "  {name}{}（编译于 {} → {}）",
+            if plan.rollback { "退回" } else { "更新" },
+            built(&plan.to.join(i.name)),
+            built(&plan.from.join(i.name))
+        ),
     }
 }
 
 /// 特权服务和新编译的不是同一个文件时提一句。每次编译出来的文件都会不同，所以这不等于必须更新。
-fn service_note(svc: Option<Installed>, installed: &Path) -> Option<String> {
-    (svc == Some(Installed::Differs)).then(|| {
-        format!(
+/// rollback 是上一版里的那一份服务程序：退回时提的是“要不要把它也换回去”。
+fn service_note(svc: Option<Installed>, installed: &Path, rollback: Option<&Path>) -> Option<String> {
+    (svc == Some(Installed::Differs)).then(|| match rollback {
+        None => format!(
             "特权服务没有动，还是之前安装的那一份（编译于 {}）。守卫规则、程序扫描或配置格式有改动时才需要更新它：anchor service upgrade，或者升级时加 --service（会弹出管理员确认）",
             built(installed)
-        )
+        ),
+        Some(prev) => format!(
+            "特权服务没有动（编译于 {}）。上一版里的那一份编译于 {}；要把它也换回去：anchor upgrade --rollback --service（会弹出管理员确认）",
+            built(installed),
+            built(prev)
+        ),
     })
 }
 
+/// 退回完成之后的提示：安装目录里已经是上一版了，服务要跟上就用它旁边的那一份。
+fn service_note_after_rollback(installed: &Path) -> String {
+    format!(
+        "特权服务没有动（编译于 {}）。要把它也换成这一版里的那一份：anchor service upgrade（会弹出管理员确认）",
+        built(installed)
+    )
+}
+
 /// 加了 --service 时，文件清单里特权服务的那一行。
-fn describe_service(svc: Installed, new: &Path, installed: &Path) -> String {
+fn describe_service(svc: Installed, new: &Path, installed: &Path, rollback: bool) -> String {
     let name = crate::util::pad("特权服务", 18);
     match svc {
         Installed::Missing => format!("  {name}没有安装，跳过"),
         Installed::Same => format!("  {name}没有变化"),
-        Installed::Differs => format!("  {name}更新（编译于 {} → {}），要管理员确认", built(installed), built(new)),
+        Installed::Differs => format!(
+            "  {name}{}（编译于 {} → {}），要管理员确认",
+            if rollback { "换成上一版里的那一份" } else { "更新" },
+            built(installed),
+            built(new)
+        ),
     }
 }
 
@@ -370,34 +515,51 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
     let here = me.parent().context("无法确定程序目录")?;
     let agent = running_agent();
     let agent_dir = agent.as_ref().and_then(|a| a.dir.clone());
-    let (from, to) = resolve(here, args.dir.as_deref(), args.to.as_deref(), agent_dir.as_deref(), autostart_dir(paths).as_deref())?;
-    let plan = plan(&from, &to)?;
+    let back = args.rollback;
+    let (from, to) = if back {
+        let (from, to) = resolve_rollback(here, args.to.as_deref(), agent_dir.as_deref(), autostart_dir(paths).as_deref())?;
+        check_previous(&from, &to)?;
+        (from, to)
+    } else {
+        resolve(here, args.dir.as_deref(), args.to.as_deref(), agent_dir.as_deref(), autostart_dir(paths).as_deref())?
+    };
+    let mut plan = plan(&from, &to)?;
+    plan.rollback = back;
     let (svc_new, installed) = (plan.from.join(SVC), svcctl::installed_exe());
     let svc = if svc_new.is_file() { Some(svcctl::compare(&svc_new, &installed)?) } else { None };
     if args.service && svc.is_none() {
+        if back {
+            bail!("上一版里没有 anchor-svc.exe，换不了特权服务。去掉 --service");
+        }
         bail!(
             "{} 里没有 anchor-svc.exe，更新不了特权服务。去掉 --service，或者先编译整个工作区（cargo build --release --workspace）",
             plan.from.display()
         );
     }
 
-    println!("升级 AI Anchor");
-    println!("  新程序  {}", plan.from.display());
-    println!("  安装到  {}", plan.to.display());
+    if back {
+        println!("退回 AI Anchor 的上一版");
+        println!("  上一版  {}", plan.from.display());
+        println!("  安装在  {}", plan.to.display());
+    } else {
+        println!("升级 AI Anchor");
+        println!("  新程序  {}", plan.from.display());
+        println!("  安装到  {}", plan.to.display());
+    }
     for i in &plan.items {
         println!("{}", describe(&plan, i));
     }
     if args.service
         && let Some(s) = svc
     {
-        println!("{}", describe_service(s, &svc_new, &installed));
+        println!("{}", describe_service(s, &svc_new, &installed, back));
     }
-    let note = if args.service { None } else { service_note(svc, &installed) };
+    let note = if args.service { None } else { service_note(svc, &installed, back.then_some(svc_new.as_path())) };
     let files = plan.changed().next().is_some();
     let do_svc = args.service && svc == Some(Installed::Differs);
 
     if !files && !do_svc {
-        println!("已经是这个版本，没有改动。");
+        println!("{}", if back { "上一版和现在装的一样，没有改动。" } else { "已经是这个版本，没有改动。" });
         if let Some(n) = note {
             println!("{n}");
         }
@@ -408,7 +570,11 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
     }
     if args.dry_run {
         if do_svc {
-            println!("会更新特权服务：弹出管理员确认，服务停几秒后用新程序启动。防火墙守卫规则不动，AI 通道不受影响。");
+            println!(
+                "{}：弹出管理员确认，服务停几秒后用{}启动。防火墙守卫规则不动，AI 通道不受影响。",
+                if back { "会把特权服务换成上一版里的那一份" } else { "会更新特权服务" },
+                if back { "它" } else { "新程序" }
+            );
         }
         if let Some(n) = note {
             println!("{n}");
@@ -417,12 +583,26 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
         return Ok(());
     }
     if do_svc {
-        // 用新编译的那一份去换：比较时用的就是它
-        svcctl::upgrade_from(&svc_new)
-            .map_err(|e| if files { e.context("anchor.exe 和 anchor-agent.exe 已经升级好了，只有特权服务没换") } else { e })?;
+        // 升级：用新编译的那一份去换，比较时用的就是它。
+        // 退回：换完文件之后 previous 里已经是刚才那一版了，上一版的服务程序现在在安装目录里。
+        let source = if back && files { plan.to.join(SVC) } else { svc_new.clone() };
+        svcctl::upgrade_from(&source).map_err(|e| {
+            if files {
+                e.context(if back {
+                    "anchor.exe 和 anchor-agent.exe 已经退回上一版，只有特权服务没换"
+                } else {
+                    "anchor.exe 和 anchor-agent.exe 已经升级好了，只有特权服务没换"
+                })
+            } else {
+                e
+            }
+        })?;
     }
-    println!("升级完成。");
-    if let Some(n) = note {
+    println!("{}", if back { "已退回上一版。" } else { "升级完成。" });
+    if back && files && note.is_some() {
+        // 文件已经换回去了：这时候再说“加 --rollback --service”就错了，那会把文件又换回来
+        println!("{}", service_note_after_rollback(&installed));
+    } else if let Some(n) = note {
         println!("{n}");
     }
     Ok(())
@@ -446,24 +626,37 @@ fn upgrade_files(paths: &Paths, plan: &Plan, agent: Option<&Agent>, dry_run: boo
         (Some(_), false) => "用户代理的程序没有变化，不重启它，AI 通道不受影响。",
         (None, _) => "用户代理没有运行，只换文件，不启动它。",
     };
+    let prev = plan.to.join(PREVIOUS);
+    let which = if plan.rollback { "上一版的" } else { "新的" };
     if dry_run {
         println!("{plain}");
+        if plan.rollback {
+            println!("现在的这一版会留在 {}，再运行一次 anchor upgrade --rollback 就换回来。", prev.display());
+        } else {
+            println!("现在的这一版会留在 {}，之后可以退回：anchor upgrade --rollback", prev.display());
+        }
         return Ok(());
     }
 
     clear_leftovers(&plan.to);
     stage(plan)?;
+    if let Err(e) = stage_previous(&plan.to) {
+        remove_staged(plan);
+        return Err(e.context("给现在的这一版留一份时出错。没有换文件，安装目录和原来一样"));
+    }
     let down_since = Instant::now();
     if let Some(a) = restart {
         println!("停止用户代理…");
         if let Err(e) = stop_agent(a) {
             remove_staged(plan);
+            discard_previous(&plan.to);
             return Err(e.context("没有换文件，安装目录和原来一样"));
         }
     }
     let agent_exe = plan.to.join(AGENT);
     let no_tray = restart.is_some_and(|a| !a.tray);
     if let Err(e) = swap(plan) {
+        discard_previous(&plan.to);
         // 文件已经换回去了；刚才停掉的用户代理要重新启动
         let back = restart.map(|_| start_agent(&agent_exe, &paths.home, no_tray));
         return Err(e.context(match back {
@@ -473,22 +666,28 @@ fn upgrade_files(paths: &Paths, plan: &Plan, agent: Option<&Agent>, dry_run: boo
         }));
     }
     if restart.is_some() {
-        println!("启动新的用户代理…");
+        println!("启动{which}用户代理…");
         match start_agent(&agent_exe, &paths.home, no_tray) {
             Ok(pid) => println!("用户代理已启动（pid {pid}），中间停了 {:.1} 秒。", down_since.elapsed().as_secs_f32()),
             Err(e) => {
                 let done: Vec<&Item> = plan.changed().collect();
                 undo(&plan.to, &done);
+                discard_previous(&plan.to);
                 let back = start_agent(&agent_exe, &paths.home, no_tray);
                 return Err(e.context(match back {
-                    Ok(_) => "新的用户代理没有启动成功。已换回原来的文件，并重新启动了原来的用户代理",
-                    Err(_) => "新的用户代理没有启动成功。已换回原来的文件，但原来的用户代理也没有启动起来：运行 anchor agent start，日志在数据目录的 logs\\agent.log",
+                    Ok(_) => format!("{which}用户代理没有启动成功。已换回原来的文件，并重新启动了原来的用户代理"),
+                    Err(_) => format!(
+                        "{which}用户代理没有启动成功。已换回原来的文件，但原来的用户代理也没有启动起来：运行 anchor agent start，日志在数据目录的 logs\\agent.log"
+                    ),
                 }));
             }
         }
     } else {
         println!("{plain}");
     }
+
+    // 文件已经换好。留上一版出错不算升级失败，只是这次退不回去
+    let kept = commit_previous(&plan.to).inspect_err(|_| discard_previous(&plan.to));
 
     let left = remove_old(plan);
     if !left.is_empty() {
@@ -499,6 +698,11 @@ fn upgrade_files(paths: &Paths, plan: &Plan, agent: Option<&Agent>, dry_run: boo
         && let Some(line) = exit_state_line()
     {
         println!("{line}");
+    }
+    match kept {
+        Ok(()) if plan.rollback => println!("刚才那一版留在 {}，再运行一次 anchor upgrade --rollback 就换回来。", prev.display()),
+        Ok(()) => println!("换下来的那一版留在 {}，要退回去：anchor upgrade --rollback", prev.display()),
+        Err(e) => println!("注意：换下来的那一版没有留成（{e:#}）。这次不能用 anchor upgrade --rollback 退回。"),
     }
     Ok(())
 }
@@ -666,12 +870,19 @@ mod tests {
     fn service_note_only_when_the_installed_one_differs() {
         let d = Dirs::new();
         let installed = d.to.join(SVC);
-        assert_eq!(service_note(None, &installed), None, "新程序里没有服务程序");
-        assert_eq!(service_note(Some(Installed::Missing), &installed), None, "没有装服务");
-        assert_eq!(service_note(Some(Installed::Same), &installed), None, "同一个文件");
+        assert_eq!(service_note(None, &installed, None), None, "新程序里没有服务程序");
+        assert_eq!(service_note(Some(Installed::Missing), &installed, None), None, "没有装服务");
+        assert_eq!(service_note(Some(Installed::Same), &installed, None), None, "同一个文件");
         d.put(&d.to, SVC, "svc 1");
-        let note = service_note(Some(Installed::Differs), &installed).unwrap();
+        let note = service_note(Some(Installed::Differs), &installed, None).unwrap();
         assert!(note.contains("anchor service upgrade") && note.contains("--service"), "{note}");
+        // 退回时：提的是把上一版里的那一份也换回去
+        assert_eq!(service_note(Some(Installed::Same), &installed, Some(&d.from.join(SVC))), None);
+        let note = service_note(Some(Installed::Differs), &installed, Some(&d.from.join(SVC))).unwrap();
+        assert!(note.contains("--rollback --service") && !note.contains("anchor service upgrade"), "{note}");
+        // 退回完成之后：文件已经是上一版，不能再让人加 --rollback
+        let note = service_note_after_rollback(&installed);
+        assert!(note.contains("anchor service upgrade") && !note.contains("--rollback"), "{note}");
     }
 
     #[test]
@@ -680,9 +891,189 @@ mod tests {
         let (new, installed) = (d.from.join(SVC), d.to.join(SVC));
         d.put(&d.from, SVC, "svc 2");
         d.put(&d.to, SVC, "svc 1");
-        assert!(describe_service(Installed::Missing, &new, &installed).contains("没有安装，跳过"));
-        assert!(describe_service(Installed::Same, &new, &installed).contains("没有变化"));
-        assert!(describe_service(Installed::Differs, &new, &installed).contains("要管理员确认"));
+        assert!(describe_service(Installed::Missing, &new, &installed, false).contains("没有安装，跳过"));
+        assert!(describe_service(Installed::Same, &new, &installed, false).contains("没有变化"));
+        let line = describe_service(Installed::Differs, &new, &installed, false);
+        assert!(line.contains("更新") && line.contains("要管理员确认"), "{line}");
+        let line = describe_service(Installed::Differs, &new, &installed, true);
+        assert!(line.contains("换成上一版里的那一份") && line.contains("要管理员确认"), "{line}");
+    }
+
+    fn list(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        v.sort();
+        v
+    }
+
+    fn texts(dir: &Path) -> (String, String, String) {
+        let t = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_else(|_| "<没有>".into());
+        (t(CLI), t(AGENT), t(SVC))
+    }
+
+    fn three(a: &str, b: &str, c: &str) -> (String, String, String) {
+        (a.into(), b.into(), c.into())
+    }
+
+    /// 换文件的那几步，按 upgrade_files 里的顺序（不含用户代理）。
+    fn install(p: &Plan) {
+        clear_leftovers(&p.to);
+        stage(p).unwrap();
+        stage_previous(&p.to).unwrap();
+        swap(p).unwrap();
+        assert_eq!(remove_old(p), Vec::<&str>::new());
+        commit_previous(&p.to).unwrap();
+    }
+
+    /// 安装目录里是第 1 版（三个程序），新程序目录里是第 2 版：anchor.exe 和服务程序变了，用户代理没变。
+    fn v1_installed_v2_built() -> Dirs {
+        let d = Dirs::new();
+        d.put(&d.to, CLI, "cli 1");
+        d.put(&d.to, AGENT, "agent 1");
+        d.put(&d.to, SVC, "svc 1");
+        d.put(&d.from, CLI, "cli 2");
+        d.put(&d.from, AGENT, "agent 1");
+        d.put(&d.from, SVC, "svc 22");
+        d
+    }
+
+    #[test]
+    fn the_replaced_version_is_kept_and_can_be_put_back() {
+        let d = v1_installed_v2_built();
+        d.put(&d.to, "sing-box.exe", "别的文件不留");
+        let prev = d.to.join(PREVIOUS);
+
+        // 升级：换文件之前，现在的这一版先复制到 previous 里，名字带 .new
+        let p = plan(&d.from, &d.to).unwrap();
+        stage(&p).unwrap();
+        stage_previous(&d.to).unwrap();
+        assert_eq!(list(&prev), ["anchor-agent.exe.new", "anchor-svc.exe.new", "anchor.exe.new"]);
+        assert!(check_previous(&prev, &d.to).is_err(), "还没换完，不能拿来退回");
+        swap(&p).unwrap();
+        assert_eq!(remove_old(&p), Vec::<&str>::new());
+        commit_previous(&d.to).unwrap();
+        assert_eq!(texts(&d.to), three("cli 2", "agent 1", "svc 22"));
+        assert_eq!(list(&prev), ["anchor-agent.exe", "anchor-svc.exe", "anchor.exe", MARK]);
+        assert_eq!(texts(&prev), three("cli 1", "agent 1", "svc 1"), "没变的用户代理也留一份：previous 是完整的一版");
+        check_previous(&prev, &d.to).unwrap();
+
+        // 退回：从 previous 再升级一次
+        let mut back = plan(&prev, &d.to).unwrap();
+        back.rollback = true;
+        assert_eq!(changes(&back), [(CLI, Change::Replace), (AGENT, Change::Same), (SVC, Change::Replace)]);
+        assert!(describe(&back, &back.items[0]).contains("退回") && describe(&p, &p.items[0]).contains("更新"));
+        install(&back);
+        assert_eq!(texts(&d.to), three("cli 1", "agent 1", "svc 1"));
+        assert_eq!(texts(&prev), three("cli 2", "agent 1", "svc 22"), "previous 里是刚才那一版");
+        assert_eq!(d.names(), ["anchor-agent.exe", "anchor-svc.exe", "anchor.exe", PREVIOUS, "sing-box.exe"]);
+
+        // 再退一次就换回来
+        check_previous(&prev, &d.to).unwrap();
+        let mut again = plan(&prev, &d.to).unwrap();
+        again.rollback = true;
+        install(&again);
+        assert_eq!(texts(&d.to), three("cli 2", "agent 1", "svc 22"));
+        assert_eq!(texts(&prev), three("cli 1", "agent 1", "svc 1"));
+        assert_eq!(list(&prev), ["anchor-agent.exe", "anchor-svc.exe", "anchor.exe", MARK]);
+    }
+
+    #[test]
+    fn a_previous_that_is_not_the_version_before_this_one_is_refused() {
+        let d = v1_installed_v2_built();
+        let prev = d.to.join(PREVIOUS);
+        let why = |d: &Dirs| check_previous(&d.to.join(PREVIOUS), &d.to).unwrap_err().to_string();
+        assert!(why(&d).contains("没有留下上一版"), "还没有升级过");
+
+        install(&plan(&d.from, &d.to).unwrap());
+        check_previous(&prev, &d.to).unwrap();
+
+        // 升级之后安装目录被手工换了一个文件：previous 不再是它的上一版
+        d.put(&d.to, CLI, "手工复制的另一版");
+        let err = why(&d);
+        assert!(err.contains("别的方式改过") && err.contains("没有做任何改动"), "{err}");
+        assert!(err.contains("anchor upgrade \""), "告诉人怎么手工装 previous 里的那一份：{err}");
+
+        // 没有记号：上次没有留完
+        std::fs::remove_file(prev.join(MARK)).unwrap();
+        assert!(why(&d).contains(MARK));
+        // 少了一个程序
+        std::fs::remove_file(prev.join(AGENT)).unwrap();
+        assert!(why(&d).contains("不完整"));
+    }
+
+    #[test]
+    fn an_upgrade_that_is_undone_keeps_the_earlier_previous() {
+        // 还没有上一版时：复制到一半的那一份删掉，目录也不留
+        let d = v1_installed_v2_built();
+        let prev = d.to.join(PREVIOUS);
+        let p = plan(&d.from, &d.to).unwrap();
+        stage(&p).unwrap();
+        stage_previous(&d.to).unwrap();
+        remove_staged(&p);
+        discard_previous(&d.to);
+        assert!(!prev.exists());
+        assert_eq!(d.names(), ["anchor-agent.exe", "anchor-svc.exe", "anchor.exe"]);
+
+        // 已经有上一版（第 1 版）时，第 3 版没装成：previous 里还是第 1 版，还能退回
+        install(&p);
+        d.put(&d.from, CLI, "cli 333");
+        let p3 = plan(&d.from, &d.to).unwrap();
+        stage(&p3).unwrap();
+        stage_previous(&d.to).unwrap();
+        assert_eq!(list(&prev).len(), 7, "三个程序、三个 .new、一个记号");
+        remove_staged(&p3);
+        discard_previous(&d.to);
+        assert_eq!(list(&prev), ["anchor-agent.exe", "anchor-svc.exe", "anchor.exe", MARK]);
+        assert_eq!(texts(&prev), three("cli 1", "agent 1", "svc 1"));
+        check_previous(&prev, &d.to).unwrap();
+    }
+
+    #[test]
+    fn a_previous_that_could_not_be_replaced_is_not_used() {
+        let d = v1_installed_v2_built();
+        let prev = d.to.join(PREVIOUS);
+        install(&plan(&d.from, &d.to).unwrap());
+
+        // 装第 3 版；往 previous 里放第 2 版时，第二个文件被别的程序打开着，改不了名
+        d.put(&d.from, CLI, "cli 333");
+        d.put(&d.from, AGENT, "agent 333");
+        let p3 = plan(&d.from, &d.to).unwrap();
+        stage(&p3).unwrap();
+        stage_previous(&d.to).unwrap();
+        swap(&p3).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(1).open(prev.join(AGENT)).unwrap();
+        let err = commit_previous(&d.to).unwrap_err().to_string();
+        assert!(err.contains("anchor-agent.exe"), "{err}");
+        drop(held);
+        discard_previous(&d.to);
+
+        // 升级本身成了；previous 里是两版混着的，没有记号，不能拿去退回
+        assert_eq!(texts(&d.to).0, "cli 333");
+        assert_eq!((texts(&prev).0, texts(&prev).1), ("cli 2".to_string(), "agent 1".to_string()), "第一个换了，第二个没换");
+        let err = check_previous(&prev, &d.to).unwrap_err().to_string();
+        assert!(err.contains(MARK), "{err}");
+
+        // 下一次升级把 previous 重新留好
+        d.put(&d.from, CLI, "cli 4444");
+        install(&plan(&d.from, &d.to).unwrap());
+        assert_eq!(texts(&prev), three("cli 333", "agent 333", "svc 22"));
+        check_previous(&prev, &d.to).unwrap();
+    }
+
+    #[test]
+    fn where_the_previous_version_is_looked_for() {
+        let d = Dirs::new();
+        let (inst, auto) = (Path::new(r"C:\inst"), Path::new(r"C:\auto"));
+        let r = |to, agent, autostart| resolve_rollback(&d.from, to, agent, autostart).map_err(|e| e.to_string());
+        let at = |dir: &Path| Ok((dir.join(PREVIOUS), dir.to_path_buf()));
+        // 和升级一样：--to 最优先，然后是用户代理所在的目录，然后是登录自启
+        assert_eq!(r(Some(inst), Some(auto), None), at(inst));
+        assert_eq!(r(None, Some(inst), Some(auto)), at(inst));
+        assert_eq!(r(None, None, Some(auto)), at(auto));
+        assert!(r(None, None, None).unwrap_err().contains("--to"), "本程序所在的目录里没有 previous");
+        // 都找不到时：本程序所在的目录里有 previous，那它就是安装目录
+        std::fs::create_dir_all(d.from.join(PREVIOUS)).unwrap();
+        assert_eq!(r(None, None, None), at(&tidy(&d.from)));
+        assert_eq!(r(None, Some(inst), None), at(inst), "找得到用户代理时不用它");
     }
 
     #[test]
