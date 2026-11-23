@@ -3,6 +3,7 @@
 
 mod daemon;
 mod install;
+mod upgrade;
 
 use anchor_core::{ipc, log, win};
 use anyhow::Result;
@@ -42,6 +43,12 @@ enum Cmd {
         #[arg(long, hide = true)]
         pause: bool,
     },
+    /// 把已安装的服务程序换成本程序这一份（需要管理员）；新的没启动成功就换回原来的
+    Upgrade {
+        /// 出错时停住窗口（从提权窗口运行时使用）
+        #[arg(long, hide = true)]
+        pause: bool,
+    },
     /// 由服务控制管理器调用
     #[command(hide = true)]
     Service,
@@ -64,11 +71,14 @@ enum Cmd {
 
 fn main() {
     let cli = Cli::parse();
-    let (r, pause) = match cli.cmd {
-        Cmd::Install { user_sid, home, pause } => (install::install(user_sid, home), pause),
-        Cmd::Uninstall { pause } => (install::uninstall(), pause),
-        Cmd::Service => (run_dispatcher(), false),
-        Cmd::Console { home, profile, dry_run, poll } => (console(home, profile, dry_run, poll.into()), false),
+    // pause：出错时停住窗口。pause_ok：成功了也停住（安装、卸载的结果只显示在提权窗口里）
+    let (r, pause, pause_ok) = match cli.cmd {
+        Cmd::Install { user_sid, home, pause } => (install::install(user_sid, home), pause, pause),
+        Cmd::Uninstall { pause } => (install::uninstall(), pause, pause),
+        // 升级成功时窗口自己关掉：结果由调用它的 anchor 在原来的终端里报告
+        Cmd::Upgrade { pause } => (upgrade::run(), pause, false),
+        Cmd::Service => (run_dispatcher(), false, false),
+        Cmd::Console { home, profile, dry_run, poll } => (console(home, profile, dry_run, poll.into()), false, false),
     };
     if let Err(e) = r {
         eprintln!("错误：{e:#}");
@@ -78,7 +88,7 @@ fn main() {
         }
         std::process::exit(1);
     }
-    if pause {
+    if pause_ok {
         eprint!("完成。按回车键关闭…");
         let _ = std::io::stdin().read_line(&mut String::new());
     }

@@ -182,6 +182,9 @@ enum Cmd {
         /// 只看会做什么，不改动
         #[arg(long)]
         dry_run: bool,
+        /// 特权服务也一起更新（弹出管理员确认）；新的没启动成功就换回原来的
+        #[arg(long)]
+        service: bool,
     },
 }
 
@@ -235,6 +238,8 @@ enum ExitCmd {
 enum SvcCmd {
     /// 安装并启动（弹出管理员确认）
     Install,
+    /// 把已安装的服务换成本程序旁边的 anchor-svc.exe（弹出管理员确认）；新的没启动成功就换回原来的
+    Upgrade,
     /// 停止并删除（弹出管理员确认）；守卫规则保留
     Uninstall,
     /// 查看状态
@@ -325,6 +330,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         },
         Cmd::Service { action } => match action {
             SvcCmd::Install => svcctl::install(&paths)?,
+            SvcCmd::Upgrade => svcctl::upgrade()?,
             SvcCmd::Uninstall => svcctl::uninstall()?,
             SvcCmd::Status => svcctl::print_service_status()?,
         },
@@ -376,7 +382,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Shortcut { target, dir } => launch::create_shortcut(&paths, &target, dir.as_deref())?,
         Cmd::Rules { format } => rules::print(&format)?,
         Cmd::Repair => sandbox::repair(&paths)?,
-        Cmd::Upgrade { dir, to, dry_run } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run })?,
+        Cmd::Upgrade { dir, to, dry_run, service } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service })?,
     }
     Ok(0)
 }

@@ -55,6 +55,15 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
     a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
 }
 
+/// 两个文件的内容是否完全相同。
+pub fn same_content(a: &Path, b: &Path) -> Result<bool> {
+    let (ma, mb) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
+    if ma.len() != mb.len() {
+        return Ok(false);
+    }
+    Ok(std::fs::read(a)? == std::fs::read(b)?)
+}
+
 /// 存在即可，不跟随重解析点（应用执行别名用 metadata 会失败）。
 pub fn exists_any(p: &Path) -> bool {
     std::fs::symlink_metadata(p).is_ok()
