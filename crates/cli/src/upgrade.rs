@@ -7,11 +7,13 @@
 //! - 正在运行的程序可以改名，不能覆盖：所以用安装目录里的 anchor.exe 升级它自己也行，
 //!   它的旧文件留到下次升级时再删。
 //!
-//! 特权服务不在这里更新：它装在 %ProgramFiles%，替换要管理员权限，走 anchor service install。
+//! 特权服务默认不动：它装在 %ProgramFiles%，替换要管理员权限。加 --service 才一起更新，
+//! 做法是以管理员身份运行新编译的 anchor-svc.exe upgrade（见 svcctl::upgrade_from），那边自己负责停、换、启动和换回。
 
 use crate::agentctl;
 use crate::config::Paths;
-use crate::util::same_path;
+use crate::svcctl::{self, Installed};
+use crate::util::{same_content, same_path};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -27,7 +29,7 @@ const AGENT: &str = "anchor-agent.exe";
 const SVC: &str = "anchor-svc.exe";
 /// 新编译的目录里必须有的。
 const REQUIRED: [&str; 2] = [CLI, AGENT];
-/// 有就一起带上的：安装目录里的这一份只是 anchor service install 用的安装源。
+/// 有就一起带上的：安装目录里的这一份只是 anchor service install / upgrade 用的安装源。
 const OPTIONAL: [&str; 1] = [SVC];
 
 const STOP_WAIT: Duration = Duration::from_secs(15);
@@ -39,6 +41,8 @@ pub struct Args {
     /// 安装目录；不写时按运行中的用户代理、登录自启的设置来找
     pub to: Option<PathBuf>,
     pub dry_run: bool,
+    /// 特权服务也一起更新（弹出管理员确认）
+    pub service: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,14 +117,6 @@ fn resolve(here: &Path, dir: Option<&Path>, to: Option<&Path>, agent_dir: Option
         );
     }
     Ok((from, to))
-}
-
-fn same_content(a: &Path, b: &Path) -> Result<bool> {
-    let (ma, mb) = (std::fs::metadata(a)?, std::fs::metadata(b)?);
-    if ma.len() != mb.len() {
-        return Ok(false);
-    }
-    Ok(std::fs::read(a)? == std::fs::read(b)?)
 }
 
 fn plan(from: &Path, to: &Path) -> Result<Plan> {
@@ -335,21 +331,24 @@ fn describe(plan: &Plan, i: &Item) -> String {
     }
 }
 
-/// 已安装的特权服务程序。目录和 anchor-svc 安装时用的一致。
-fn installed_service() -> PathBuf {
-    std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("AI Anchor").join(SVC)
+/// 特权服务和新编译的不是同一个文件时提一句。每次编译出来的文件都会不同，所以这不等于必须更新。
+fn service_note(svc: Option<Installed>, installed: &Path) -> Option<String> {
+    (svc == Some(Installed::Differs)).then(|| {
+        format!(
+            "特权服务没有动，还是之前安装的那一份（编译于 {}）。守卫规则、程序扫描或配置格式有改动时才需要更新它：anchor service upgrade，或者升级时加 --service（会弹出管理员确认）",
+            built(installed)
+        )
+    })
 }
 
-/// 特权服务和新编译的不是同一个文件时提一句。每次编译出来的文件都会不同，所以这不等于必须更新。
-fn service_note(from: &Path, installed: &Path) -> Option<String> {
-    let src = from.join(SVC);
-    if !src.is_file() || !installed.is_file() || same_content(&src, installed).unwrap_or(true) {
-        return None;
+/// 加了 --service 时，文件清单里特权服务的那一行。
+fn describe_service(svc: Installed, new: &Path, installed: &Path) -> String {
+    let name = crate::util::pad("特权服务", 18);
+    match svc {
+        Installed::Missing => format!("  {name}没有安装，跳过"),
+        Installed::Same => format!("  {name}没有变化"),
+        Installed::Differs => format!("  {name}更新（编译于 {} → {}），要管理员确认", built(installed), built(new)),
     }
-    Some(format!(
-        "特权服务没有动，还是之前安装的那一份（编译于 {}）。守卫规则、程序扫描或配置格式有改动时才需要更新它：anchor service install（会弹出管理员确认）",
-        built(installed)
-    ))
 }
 
 /// 启动后等出口核对有结果（最多 10 秒），返回那一行状态。
@@ -373,6 +372,14 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
     let agent_dir = agent.as_ref().and_then(|a| a.dir.clone());
     let (from, to) = resolve(here, args.dir.as_deref(), args.to.as_deref(), agent_dir.as_deref(), autostart_dir(paths).as_deref())?;
     let plan = plan(&from, &to)?;
+    let (svc_new, installed) = (plan.from.join(SVC), svcctl::installed_exe());
+    let svc = if svc_new.is_file() { Some(svcctl::compare(&svc_new, &installed)?) } else { None };
+    if args.service && svc.is_none() {
+        bail!(
+            "{} 里没有 anchor-svc.exe，更新不了特权服务。去掉 --service，或者先编译整个工作区（cargo build --release --workspace）",
+            plan.from.display()
+        );
+    }
 
     println!("升级 AI Anchor");
     println!("  新程序  {}", plan.from.display());
@@ -380,14 +387,51 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
     for i in &plan.items {
         println!("{}", describe(&plan, i));
     }
-    let note = service_note(&plan.from, &installed_service());
+    if args.service
+        && let Some(s) = svc
+    {
+        println!("{}", describe_service(s, &svc_new, &installed));
+    }
+    let note = if args.service { None } else { service_note(svc, &installed) };
+    let files = plan.changed().next().is_some();
+    let do_svc = args.service && svc == Some(Installed::Differs);
 
-    if plan.changed().next().is_none() {
+    if !files && !do_svc {
         println!("已经是这个版本，没有改动。");
+        if let Some(n) = note {
+            println!("{n}");
+        }
         return Ok(());
     }
+    if files {
+        upgrade_files(paths, &plan, agent.as_ref(), args.dry_run)?;
+    }
+    if args.dry_run {
+        if do_svc {
+            println!("会更新特权服务：弹出管理员确认，服务停几秒后用新程序启动。防火墙守卫规则不动，AI 通道不受影响。");
+        }
+        if let Some(n) = note {
+            println!("{n}");
+        }
+        println!("（预览，没有做任何改动。去掉 --dry-run 执行）");
+        return Ok(());
+    }
+    if do_svc {
+        // 用新编译的那一份去换：比较时用的就是它
+        svcctl::upgrade_from(&svc_new)
+            .map_err(|e| if files { e.context("anchor.exe 和 anchor-agent.exe 已经升级好了，只有特权服务没换") } else { e })?;
+    }
+    println!("升级完成。");
+    if let Some(n) = note {
+        println!("{n}");
+    }
+    Ok(())
+}
+
+/// 换程序文件，需要时重启用户代理。预览时只说会做什么。
+fn upgrade_files(paths: &Paths, plan: &Plan, agent: Option<&Agent>, dry_run: bool) -> Result<()> {
     // 用户代理的程序没变就不重启它；它没在运行就只换文件
-    let restart = agent.as_ref().filter(|_| plan.changes(AGENT));
+    let restart = agent.filter(|_| plan.changes(AGENT));
     if let Some(a) = restart
         && let Some(d) = &a.dir
         && !same_path(&tidy(d), &plan.to)
@@ -397,30 +441,29 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
             d.display()
         );
     }
-    let plain = match (&agent, restart.is_some()) {
+    let plain = match (agent, restart.is_some()) {
         (_, true) => "会重启用户代理：AI 通道中断几秒，核对出口后放行。",
         (Some(_), false) => "用户代理的程序没有变化，不重启它，AI 通道不受影响。",
         (None, _) => "用户代理没有运行，只换文件，不启动它。",
     };
-    if args.dry_run {
+    if dry_run {
         println!("{plain}");
-        println!("（预览，没有做任何改动。去掉 --dry-run 执行）");
         return Ok(());
     }
 
     clear_leftovers(&plan.to);
-    stage(&plan)?;
+    stage(plan)?;
     let down_since = Instant::now();
     if let Some(a) = restart {
         println!("停止用户代理…");
         if let Err(e) = stop_agent(a) {
-            remove_staged(&plan);
+            remove_staged(plan);
             return Err(e.context("没有换文件，安装目录和原来一样"));
         }
     }
     let agent_exe = plan.to.join(AGENT);
     let no_tray = restart.is_some_and(|a| !a.tray);
-    if let Err(e) = swap(&plan) {
+    if let Err(e) = swap(plan) {
         // 文件已经换回去了；刚才停掉的用户代理要重新启动
         let back = restart.map(|_| start_agent(&agent_exe, &paths.home, no_tray));
         return Err(e.context(match back {
@@ -447,7 +490,7 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
         println!("{plain}");
     }
 
-    let left = remove_old(&plan);
+    let left = remove_old(plan);
     if !left.is_empty() {
         // 只会是正在运行的本程序
         println!("旧的 {} 还在运行，暂时留作 .old，下次升级时删除。", left.join("、"));
@@ -456,10 +499,6 @@ pub fn run(paths: &Paths, args: &Args) -> Result<()> {
         && let Some(line) = exit_state_line()
     {
         println!("{line}");
-    }
-    println!("升级完成。");
-    if let Some(n) = note {
-        println!("{n}");
     }
     Ok(())
 }
@@ -627,13 +666,23 @@ mod tests {
     fn service_note_only_when_the_installed_one_differs() {
         let d = Dirs::new();
         let installed = d.to.join(SVC);
-        assert_eq!(service_note(&d.from, &installed), None, "新程序里没有服务程序");
-        d.put(&d.from, SVC, "svc 2");
-        assert_eq!(service_note(&d.from, &installed), None, "没有装服务");
-        d.put(&d.to, SVC, "svc 2");
-        assert_eq!(service_note(&d.from, &installed), None, "同一个文件");
+        assert_eq!(service_note(None, &installed), None, "新程序里没有服务程序");
+        assert_eq!(service_note(Some(Installed::Missing), &installed), None, "没有装服务");
+        assert_eq!(service_note(Some(Installed::Same), &installed), None, "同一个文件");
         d.put(&d.to, SVC, "svc 1");
-        assert!(service_note(&d.from, &installed).unwrap().contains("anchor service install"));
+        let note = service_note(Some(Installed::Differs), &installed).unwrap();
+        assert!(note.contains("anchor service upgrade") && note.contains("--service"), "{note}");
+    }
+
+    #[test]
+    fn service_line_in_the_file_list() {
+        let d = Dirs::new();
+        let (new, installed) = (d.from.join(SVC), d.to.join(SVC));
+        d.put(&d.from, SVC, "svc 2");
+        d.put(&d.to, SVC, "svc 1");
+        assert!(describe_service(Installed::Missing, &new, &installed).contains("没有安装，跳过"));
+        assert!(describe_service(Installed::Same, &new, &installed).contains("没有变化"));
+        assert!(describe_service(Installed::Differs, &new, &installed).contains("要管理员确认"));
     }
 
     #[test]

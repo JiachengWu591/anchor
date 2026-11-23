@@ -7,7 +7,7 @@ use crate::util::confirm;
 use crate::win;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, WaitForSingleObject};
 use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
@@ -93,6 +93,83 @@ pub fn uninstall() -> Result<()> {
     }
     println!("特权服务已卸载。守卫规则保持不变。");
     Ok(())
+}
+
+/// 已安装的服务程序。目录和 anchor-svc 安装时用的一致。
+pub fn installed_exe() -> PathBuf {
+    std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("AI Anchor").join("anchor-svc.exe")
+}
+
+/// 已安装的服务程序和另一份（新编译的）比。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installed {
+    /// 没有装服务
+    Missing,
+    Same,
+    Differs,
+}
+
+pub fn compare(new: &Path, installed: &Path) -> Result<Installed> {
+    if !installed.is_file() {
+        return Ok(Installed::Missing);
+    }
+    let same = crate::util::same_content(new, installed).with_context(|| format!("比较 {} 和已安装的服务程序失败", new.display()))?;
+    Ok(if same { Installed::Same } else { Installed::Differs })
+}
+
+/// 更新后服务的情况，一行。
+fn brief_status() -> String {
+    // 刚启动的服务可能还没做完第一次刷新；要一次刷新后的结果
+    match call("guard.status", json!({ "fresh": true })) {
+        Ok(v) => {
+            let rules = v["rules"].as_array().map(Vec::len).unwrap_or(0);
+            let expected = v["expected"].as_array().map(Vec::len).unwrap_or(0);
+            let missing = v["missing"].as_array().map(Vec::len).unwrap_or(0);
+            let covered = if missing == 0 { format!("配置里的 {expected} 个程序都已受守卫") } else { format!("有 {missing} 个程序还没受守卫（anchor guard status 查看）") };
+            format!("特权服务已更新，正在运行；守卫规则 {rules} 条，{covered}。")
+        }
+        Err(CallError::NotRunning) => "服务程序已更新，但特权服务现在没有运行。启动：anchor service install".to_string(),
+        Err(e) => format!("特权服务已更新；查询它的状态失败：{e}"),
+    }
+}
+
+/// 把已安装的服务换成 exe 这一份：以管理员身份运行 exe upgrade，由它停服务、换文件、启动，出错时换回。
+pub fn upgrade_from(exe: &Path) -> Result<()> {
+    if !exe.is_file() {
+        bail!("{} 不存在：新程序目录里没有服务程序", exe.display());
+    }
+    let installed = installed_exe();
+    match compare(exe, &installed)? {
+        Installed::Missing => bail!("特权服务没有安装（{} 不存在）。安装：anchor service install", installed.display()),
+        Installed::Same => {
+            println!("特权服务已经是这个版本，没有改动。");
+            return Ok(());
+        }
+        Installed::Differs => {}
+    }
+    if win::is_elevated() {
+        let st = std::process::Command::new(exe).arg("upgrade").status()?;
+        if !st.success() {
+            bail!("特权服务没有更新，原因见上面的输出");
+        }
+    } else {
+        println!("更新特权服务需要管理员权限，将弹出确认窗口…");
+        let code = run_elevated(exe, "upgrade --pause")?;
+        if code != 0 {
+            bail!("特权服务没有更新（退出码 {code}），原因见提权窗口里的输出");
+        }
+    }
+    // 从外面再看一眼：文件确实换了
+    if compare(exe, &installed)? != Installed::Same {
+        bail!("提权的那一步报告成功，但 {} 和新程序仍然不一样", installed.display());
+    }
+    println!("{}", brief_status());
+    Ok(())
+}
+
+/// anchor service upgrade：用本程序旁边的 anchor-svc.exe。
+pub fn upgrade() -> Result<()> {
+    upgrade_from(&sibling("anchor-svc.exe")?)
 }
 
 /// 启动 AI 程序前请服务刷新一次守卫（应用刚更新、服务还没轮询到时补上新版本）。
@@ -212,6 +289,23 @@ pub fn print_service_status() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compares_the_installed_service_program() {
+        use super::{Installed, compare};
+        let dir = std::env::temp_dir().join(format!("anchor-svcctl-{}", crate::util::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (new, installed) = (dir.join("new.exe"), dir.join("installed.exe"));
+        std::fs::write(&new, "svc 2").unwrap();
+        assert_eq!(compare(&new, &installed).unwrap(), Installed::Missing);
+        std::fs::write(&installed, "svc 1").unwrap();
+        assert_eq!(compare(&new, &installed).unwrap(), Installed::Differs);
+        std::fs::write(&installed, "svc 2").unwrap();
+        assert_eq!(compare(&new, &installed).unwrap(), Installed::Same);
+        std::fs::remove_file(&new).unwrap();
+        assert!(compare(&new, &installed).is_err(), "新程序读不了是错误，不当成“不一样”");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn quote_arg_drops_trailing_backslash() {
         assert_eq!(super::quote_arg(r"C:\a b\"), r#""C:\a b""#);

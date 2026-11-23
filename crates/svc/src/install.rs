@@ -39,7 +39,7 @@ pub fn log_file() -> PathBuf {
     data_dir().join("svc.log")
 }
 
-fn program_dir() -> PathBuf {
+pub fn program_dir() -> PathBuf {
     std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Program Files")).join("AI Anchor")
 }
 
