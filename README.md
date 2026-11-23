@@ -360,6 +360,8 @@ Cargo workspace，四个 crate：
 
 ## 测试状态
 
+每次推到 `main`、每个 PR，GitHub Actions 都在 Windows 上编译整个工作区并跑单元测试（`cargo build --workspace --locked`、`cargo test --workspace --locked`，见 `.github/workflows/ci.yml`）。端到端测试和真机实测不在里面：它们要 sing-box、真的网卡和已安装的服务，仍然是手动做的，结果记在下面各节。
+
 ### P2 · 升级特权服务
 
 `anchor upgrade` 原来不动特权服务，要更新它只能重新运行 `anchor service install`：那会重写登记信息、重设权限，而且新的服务起不来时不会换回。现在有专门的一步，只换程序，起不来就换回：`anchor upgrade --service`，或者单独运行 `anchor service upgrade`。两者都是以管理员身份运行新编译的 `anchor-svc.exe upgrade`。

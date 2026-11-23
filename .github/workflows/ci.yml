@@ -1,0 +1,50 @@
+name: CI
+
+# 每次推到 main、每个 PR 都编译整个工作区并跑单元测试。
+# 只有单元测试：端到端测试要 sing-box、真的网卡和已安装的服务，在托管的机器上跑不了。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 只读权限：这个工作流不写仓库、不发评论。
+permissions:
+  contents: read
+
+# 同一个分支或 PR 上有新的提交时，取消还在跑的那一次。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build and test (Windows)
+    # 项目只支持 Windows（windows-sys、注册表、Windows 服务）。
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      # 按提交号固定，不跟着标签走。
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # 托管机器自带 rustup；这里换成当前的 stable，和本机开发用的一致。
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Use stable
+        run: rustup default stable
+
+      - name: Show versions
+        run: cargo --version --verbose
+
+      # --locked：Cargo.lock 和 Cargo.toml 对不上时失败，不悄悄换依赖的版本。
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
