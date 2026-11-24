@@ -87,7 +87,7 @@ fn lines_view(sh: &Shared) -> Result<Value> {
 }
 
 /// 交给线路控制器线程处理，等它回话（它每 0.2 秒看一次）。
-fn line_cmd(sh: &Shared, cmd: LineCmd) -> Result<Value> {
+pub(crate) fn line_cmd(sh: &Shared, cmd: LineCmd) -> Result<Value> {
     lines_view(sh)?;
     let (tx, rx) = std::sync::mpsc::channel();
     sh.line_cmds.lock().unwrap_or_else(|e| e.into_inner()).push((cmd, tx));

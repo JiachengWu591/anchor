@@ -256,6 +256,33 @@ button:disabled { opacity: 0.5; cursor: default; }
 }
 
 button.link { border: 0; padding: 2px 0; background: none; color: var(--accent); }
+button.mini { flex: none; padding: 2px 9px; font-size: 12px; white-space: nowrap; }
+button.primary { margin-top: 10px; width: 100%; background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+
+@media (prefers-color-scheme: dark) {
+  button.primary { color: #0f1626; }
+}
+
+/* ---- 线路、出口：一行一个，右边是能做的事 ---- */
+
+.mode { color: var(--muted); font-size: 12px; text-align: right; overflow-wrap: anywhere; }
+.controls .row { align-items: center; }
+.controls .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; border: 2px solid var(--idle); }
+.controls li[data-state="ok"] .dot { border-color: var(--ok); background: var(--ok); }
+.controls li[data-state="fail"] .dot { border-color: var(--fail); background: var(--fail); }
+.controls .btns { flex: none; display: flex; gap: 6px; }
+.controls .why { margin-left: 18px; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.controls li[data-state="fail"] .why { color: var(--fail); }
+.controls .what small.chip {
+  margin-left: 6px;
+  padding: 0 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-bg);
+  white-space: nowrap;
+}
 button.link:hover { text-decoration: underline; }
 details .link { margin-top: 8px; }
 

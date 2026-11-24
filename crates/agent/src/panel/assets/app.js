@@ -120,13 +120,70 @@ function renderFacts(facts) {
   for (const f of facts) dl.append(el('dt', '', f.k), el('dd', '', f.v));
 }
 
+// ---- 线路、出口、基线 ----
+
+function actionButton(label, action, name) {
+  const b = el('button', 'mini', label);
+  b.type = 'button';
+  b.dataset.action = action;
+  if (name) b.dataset.name = name;
+  b.addEventListener('click', () => act(b));
+  return b;
+}
+
+function controlRow(state, name, chips, buttons, text) {
+  const li = el('li');
+  if (state) li.dataset.state = state;
+  const row = el('div', 'row');
+  const what = el('span', 'what', name);
+  for (const c of chips) what.append(el('small', 'chip', c));
+  const btns = el('span', 'btns');
+  btns.append(...buttons);
+  row.append(el('span', 'dot'), what, btns);
+  li.append(row, el('div', 'why', text));
+  return li;
+}
+
+function renderControls(c) {
+  $('ch-baseline').hidden = !c.baseline_needed;
+
+  $('lines-card').hidden = !c.lines;
+  const lines = $('lines');
+  lines.replaceChildren();
+  if (c.lines) {
+    $('lines-mode').textContent = c.lines.mode;
+    for (const l of c.lines.rows) {
+      const chips = [];
+      if (l.current) chips.push('当前');
+      if (l.pinned) chips.push('固定');
+      const buttons = [];
+      if (!l.current) buttons.push(actionButton('换到这条', 'line.use', l.name));
+      buttons.push(l.pinned ? actionButton('取消固定', 'line.unpin') : actionButton('固定在这条', 'line.pin', l.name));
+      lines.append(controlRow(l.state, l.name, chips, buttons, l.text));
+    }
+  }
+
+  $('exits-card').hidden = !c.exits.length;
+  const exits = $('exits');
+  exits.replaceChildren();
+  for (const e of c.exits) {
+    const chips = [];
+    if (e.active) chips.push('当前');
+    if (e.primary) chips.push('主出口');
+    const buttons = e.active ? [] : [actionButton('切换…', 'exit.use', e.name)];
+    const text = (e.label ? e.label + ' · ' : '') + (e.baseline ? '基线 ' + e.baseline : '还没有登记基线');
+    exits.append(controlRow(e.active ? 'ok' : '', e.name, chips, buttons, text));
+  }
+}
+
 function renderState(st) {
-  const key = JSON.stringify([st.channel, st.path, st.culprit, st.facts]);
+  const key = JSON.stringify([st.channel, st.path, st.culprit, st.facts, st.controls]);
   if (key === lastState) return;
   lastState = key;
   renderChannel(st.channel);
   renderPath(st.path, st.culprit);
   renderFacts(st.facts);
+  renderControls(st.controls || { baseline_needed: false, lines: null, exits: [] });
 }
 
 // ---- 统计 ----
@@ -285,7 +342,8 @@ function toast(text, bad) {
 async function act(button) {
   button.disabled = true;
   try {
-    const r = await api('/api/action', { action: button.dataset.action });
+    // 线路名、出口名放在 data-name 里；没有的话这一项不会发出去
+    const r = await api('/api/action', { action: button.dataset.action, name: button.dataset.name });
     toast(r.message, false);
     refresh();
   } catch (e) {
