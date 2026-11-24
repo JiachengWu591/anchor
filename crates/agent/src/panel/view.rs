@@ -218,7 +218,7 @@ pub fn channel(st: &Status, stuck: Option<Stuck>, ctx: &NoticeCtx) -> Channel {
             "locked",
             "AI 通道已锁住",
             format!("出口 IP 已变化：基线 {}，现在 {}", e.baseline, e.actual.as_deref().unwrap_or("未知")),
-            "切回原来的出口会自动恢复；确认要换成新 IP，运行 anchor baseline。",
+            "切回原来的出口会自动恢复；确认要换成新 IP，点下面的“登记现在的出口为基线”（或运行 anchor baseline）。",
         ),
         "unverifiable" => ch(
             "locked",
@@ -226,7 +226,7 @@ pub fn channel(st: &Status, stuck: Option<Stuck>, ctx: &NoticeCtx) -> Channel {
             "出口能连通，但 IP 回显服务都连不上，无法核对".into(),
             "回显服务恢复后自动核对并放行；一直不行，可以在 [check] ip_echo 换成别的服务。",
         ),
-        "no_baseline" => ch("locked", "AI 通道已锁住", "还没有登记出口基线".into(), "确认现在的出口是你要的，然后运行 anchor baseline。"),
+        "no_baseline" => ch("locked", "AI 通道已锁住", "还没有登记出口基线".into(), "确认现在的出口是你要的，然后点下面的“登记现在的出口为基线”（或运行 anchor baseline）。"),
         "" => ch("verifying", "等待核对出口", String::new(), ""),
         _ if e.exit_down => match stuck {
             Some(s) => {
@@ -241,6 +241,127 @@ pub fn channel(st: &Status, stuck: Option<Stuck>, ctx: &NoticeCtx) -> Channel {
         c.locked_ms = e.locked_ms;
     }
     c
+}
+
+/// 面板上能直接做的几件事要用到的数据。没有配置线路、没有备用出口时，对应的那一栏不出现。
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Controls {
+    /// AI 通道因为“出口 IP 变了”或“还没有基线”锁着：这时给一个登记基线的按钮
+    pub baseline_needed: bool,
+    pub lines: Option<Lines>,
+    /// 主出口和备用出口；只有一个出口时是空的
+    pub exits: Vec<ExitRow>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct Lines {
+    /// 自动换线 / 固定在某条 / 手动
+    pub mode: String,
+    pub pinned: bool,
+    pub rows: Vec<LineRow>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct LineRow {
+    pub name: String,
+    pub current: bool,
+    pub pinned: bool,
+    /// ok / fail / unknown：最近一次探测
+    pub state: &'static str,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ExitRow {
+    pub name: String,
+    pub label: String,
+    /// 登记的基线 IP；还没登记时为空
+    pub baseline: String,
+    pub active: bool,
+    pub primary: bool,
+}
+
+/// 登记基线的按钮只在它能解决问题时出现：内核在运行、配置没错，而通道是因为出口 IP 对不上或没有基线才锁着。
+pub fn baseline_needed(st: &Status) -> bool {
+    st.config_error.is_none() && st.kernel == KernelState::Running && !st.lines_down && matches!(st.exit.state.as_str(), "changed" | "no_baseline")
+}
+
+/// 线路控制器公布的内容（和 anchor line list 是同一份）整理成面板的一栏。
+pub fn lines(v: Option<&Value>) -> Option<Lines> {
+    let v = v?;
+    let rows: Vec<LineRow> = v["lines"]
+        .as_array()?
+        .iter()
+        .filter_map(|l| {
+            let name = l["name"].as_str()?.to_string();
+            let n = l["samples"].as_u64().unwrap_or(0);
+            let mut bits = Vec::new();
+            let state = match (l["last_ok"].as_bool(), l["last_ms"].as_u64()) {
+                (Some(true), Some(ms)) => {
+                    bits.push(format!("通，{ms} ms"));
+                    "ok"
+                }
+                (Some(true), None) => {
+                    bits.push("通".to_string());
+                    "ok"
+                }
+                (Some(false), _) => {
+                    bits.push("不通".to_string());
+                    "fail"
+                }
+                _ => {
+                    bits.push("还没测".to_string());
+                    "unknown"
+                }
+            };
+            if let Some(r) = l["rate"].as_f64() {
+                bits.push(format!("5 分钟成功率 {:.0}%（{n} 次）", r * 100.0));
+            }
+            if let Some(m) = l["median_ms"].as_u64() {
+                bits.push(format!("中位数 {m} ms"));
+            }
+            Some(LineRow {
+                name,
+                current: l["current"].as_bool().unwrap_or(false),
+                pinned: l["pinned"].as_bool().unwrap_or(false),
+                state,
+                text: bits.join(" · "),
+            })
+        })
+        .collect();
+    if rows.is_empty() {
+        return None;
+    }
+    let pinned = v["mode"].as_str() == Some("pinned");
+    let mode = match v["mode"].as_str().unwrap_or("") {
+        "pinned" => format!("固定在 {}，不自动换线", v["pinned"].as_str().unwrap_or("?")),
+        "manual" => "手动模式，不自动换线".to_string(),
+        _ => "自动换线".to_string(),
+    };
+    let mode = if v["all_down"].as_bool().unwrap_or(false) { format!("{mode}；所有线路都不可用") } else { mode };
+    Some(Lines { mode, pinned, rows })
+}
+
+/// 有备用出口时列出所有出口；只有一个出口就没有什么可换的。
+pub fn exits(all: &[anchor_core::config::ExitEntry]) -> Vec<ExitRow> {
+    if all.len() < 2 {
+        return Vec::new();
+    }
+    all.iter()
+        .map(|e| ExitRow {
+            name: e.name.clone(),
+            // 配置给的说明是“名字（类型 地址）”：名字已经单独显示了，这里只留括号里的
+            label: e
+                .label
+                .strip_prefix(e.name.as_str())
+                .map(|rest| rest.trim().trim_start_matches('（').trim_end_matches('）').to_string())
+                .filter(|rest| !rest.is_empty())
+                .unwrap_or_else(|| e.label.clone()),
+            baseline: e.baseline_ip.clone(),
+            active: e.active,
+            primary: e.primary,
+        })
+        .collect()
 }
 
 fn kernel_label(k: KernelState) -> &'static str {
@@ -488,6 +609,89 @@ mod tests {
 
     fn input<'a>(last: &'a [Probe], st: &'a Status) -> PathIn<'a> {
         PathIn { now_ms: NOW, last, has_uplink: Some(true), via_vpn: true, vpn_seen: true, bind_if: Some("vpn0"), bind_if_down: false, st }
+    }
+
+    #[test]
+    fn the_baseline_button_only_when_it_would_help() {
+        let mut st = open_status();
+        assert!(!baseline_needed(&st), "放行着");
+        st.exit.state = "changed".into();
+        assert!(baseline_needed(&st), "出口 IP 变了");
+        st.exit.state = "no_baseline".into();
+        assert!(baseline_needed(&st), "还没有基线");
+        // 这些情况登记基线解决不了问题，或者现在测不了出口
+        st.exit.state = "unverifiable".into();
+        assert!(!baseline_needed(&st));
+        st.exit.state = "changed".into();
+        st.kernel = KernelState::Restarting;
+        assert!(!baseline_needed(&st), "内核没在运行");
+        st.kernel = KernelState::Running;
+        st.config_error = Some("第 3 行".into());
+        assert!(!baseline_needed(&st), "配置有误");
+        st.config_error = None;
+        st.lines_down = true;
+        assert!(!baseline_needed(&st), "线路都不通");
+        // 两种情况下的建议里都提到了按钮，也留着命令
+        st.lines_down = false;
+        for state in ["changed", "no_baseline"] {
+            st.exit.state = state.into();
+            let c = channel(&st, None, &NoticeCtx { bind_if: None, has_backup: false });
+            assert!(c.advice.contains("登记现在的出口为基线") && c.advice.contains("anchor baseline"), "{}", c.advice);
+        }
+    }
+
+    #[test]
+    fn lines_as_the_panel_shows_them() {
+        assert_eq!(lines(None), None, "没有配置线路");
+        assert_eq!(lines(Some(&json!({ "mode": "auto", "lines": [] }))), None);
+        let v = json!({
+            "mode": "auto", "current": "hk", "pinned": null, "all_down": false,
+            "lines": [
+                { "name": "hk", "current": true, "pinned": false, "samples": 30, "rate": 0.967, "median_ms": 88, "last_ok": true, "last_ms": 91 },
+                { "name": "jp", "current": false, "pinned": false, "samples": 30, "rate": 0.5, "median_ms": null, "last_ok": false, "last_ms": null },
+                { "name": "sg", "current": false, "pinned": false, "samples": 0, "rate": null, "median_ms": null, "last_ok": null, "last_ms": null },
+            ],
+        });
+        let l = lines(Some(&v)).unwrap();
+        assert_eq!((l.mode.as_str(), l.pinned), ("自动换线", false));
+        let rows: Vec<(&str, bool, &str, &str)> = l.rows.iter().map(|r| (r.name.as_str(), r.current, r.state, r.text.as_str())).collect();
+        assert_eq!(
+            rows,
+            [
+                ("hk", true, "ok", "通，91 ms · 5 分钟成功率 97%（30 次） · 中位数 88 ms"),
+                ("jp", false, "fail", "不通 · 5 分钟成功率 50%（30 次）"),
+                ("sg", false, "unknown", "还没测"),
+            ]
+        );
+
+        let mut v = v;
+        v["mode"] = json!("pinned");
+        v["pinned"] = json!("jp");
+        v["all_down"] = json!(true);
+        v["lines"][1]["pinned"] = json!(true);
+        let l = lines(Some(&v)).unwrap();
+        assert_eq!((l.mode.as_str(), l.pinned), ("固定在 jp，不自动换线；所有线路都不可用", true));
+        assert!(l.rows[1].pinned && !l.rows[0].pinned);
+    }
+
+    #[test]
+    fn exits_are_listed_only_when_there_is_a_choice() {
+        use anchor_core::config::ExitEntry;
+        let e = |name: &str, ip: &str, active: bool, primary: bool| ExitEntry {
+            name: name.into(),
+            label: format!("{name}（socks 203.0.113.11:1080）"),
+            baseline_ip: ip.into(),
+            active,
+            primary,
+        };
+        assert_eq!(exits(&[]), []);
+        assert_eq!(exits(&[e("home", "203.0.113.10", true, true)]), [], "只有一个出口，没有什么可换的");
+        let rows = exits(&[e("home", "203.0.113.10", false, true), e("backup", "", true, false)]);
+        let got: Vec<(&str, &str, bool, bool)> = rows.iter().map(|r| (r.name.as_str(), r.baseline.as_str(), r.active, r.primary)).collect();
+        assert_eq!(got, [("home", "203.0.113.10", false, true), ("backup", "", true, false)]);
+        assert_eq!(rows[0].label, "socks 203.0.113.11:1080", "名字不重复写");
+        let odd = exits(&[e("home", "", true, true), ExitEntry { name: "b".into(), label: "别的写法".into(), baseline_ip: String::new(), active: false, primary: false }]);
+        assert_eq!(odd[1].label, "别的写法", "不是那种格式就原样显示");
     }
 
     #[test]

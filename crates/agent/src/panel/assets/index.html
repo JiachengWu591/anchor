@@ -20,11 +20,26 @@
       <span id="ch-timer" class="timer" hidden></span>
     </div>
     <p id="ch-advice" class="advice" hidden></p>
+    <button type="button" id="ch-baseline" class="primary" data-action="baseline" hidden>登记现在的出口为基线…</button>
   </section>
 
   <section class="card">
     <h2>从这台电脑到 AI 服务</h2>
     <ol id="path" class="path"></ol>
+  </section>
+
+  <section id="lines-card" class="card" hidden>
+    <div class="card-head">
+      <h2>线路</h2>
+      <span id="lines-mode" class="mode"></span>
+    </div>
+    <ul id="lines" class="list controls"></ul>
+  </section>
+
+  <section id="exits-card" class="card" hidden>
+    <h2>出口</h2>
+    <ul id="exits" class="list controls"></ul>
+    <p class="more">切换出口会改变 AI 服务看到的 IP，要先关闭正在运行的 AI 程序。点“切换”只是打开一个命令窗口，在那里确认之后才会切换。</p>
   </section>
 
   <section class="actions" aria-label="操作">
