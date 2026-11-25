@@ -352,10 +352,22 @@ pub fn remove(yes: bool) -> Result<()> {
         println!("未修改。");
         return Ok(());
     }
+    let n = remove_all()?;
+    println!("已移除 {n} 条守卫规则。");
+    Ok(())
+}
+
+/// 删除规则组里的全部规则（需要管理员），返回删了几条。不询问：调用方负责确认。
+pub fn remove_all() -> Result<usize> {
     require_admin()?;
     let n = ps::run_ok(&format!("{}\nif ($rules.Count) {{ $rules | Remove-NetFirewallRule }}\n$rules.Count", load_rules_ps()))?;
-    println!("已移除 {} 条守卫规则。", n.trim());
-    Ok(())
+    n.trim().parse().with_context(|| format!("看不懂删除规则的结果：{}", n.trim()))
+}
+
+/// 规则组里现在有几条规则（只读，不需要管理员）。
+pub fn rule_count() -> Result<usize> {
+    let n = ps::run_ok(&format!("{}\n$rules.Count", load_rules_ps()))?;
+    n.trim().parse().with_context(|| format!("看不懂查询规则的结果：{}", n.trim()))
 }
 
 pub fn set_enabled(enabled: bool, yes: bool) -> Result<()> {

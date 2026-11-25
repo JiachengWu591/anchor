@@ -21,8 +21,8 @@ fn pipe() -> &'static str {
     PIPE.get().map_or(AGENT_PIPE, String::as_str)
 }
 
-const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const RUN_VALUE: &str = "AI Anchor";
+pub(crate) const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+pub(crate) const RUN_VALUE: &str = "AI Anchor";
 const DETACHED_PROCESS: u32 = 0x0000_0008;
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;

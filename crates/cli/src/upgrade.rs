@@ -37,9 +37,9 @@ pub(crate) const REQUIRED: [&str; 2] = [CLI, AGENT];
 const OPTIONAL: [&str; 1] = [SVC];
 
 /// 升级时换下来的那一版放在安装目录的这个子目录里。
-const PREVIOUS: &str = "previous";
+pub(crate) const PREVIOUS: &str = "previous";
 /// previous\ 里的记号：换上去的那一版（文件名、大小、修改时间）。退回之前用它确认安装目录还是那一版。
-const MARK: &str = "replaced-by.txt";
+pub(crate) const MARK: &str = "replaced-by.txt";
 const MARK_HEADER: &str = "# anchor upgrade 留下的上一版。下面是换上去的那一版：文件名、大小、修改时间（毫秒）。\n# anchor upgrade --rollback 用它确认安装目录在那之后没有被别的方式改过。\n";
 
 const STOP_WAIT: Duration = Duration::from_secs(15);
@@ -99,14 +99,14 @@ pub(crate) fn tidy(p: &Path) -> PathBuf {
 }
 
 /// 登录自启的那一行（"程序" --home "数据目录"）里的程序和数据目录。
-fn parse_autostart(line: &str) -> Option<(PathBuf, PathBuf)> {
+pub(crate) fn parse_autostart(line: &str) -> Option<(PathBuf, PathBuf)> {
     let mut parts = line.split('"');
     let (_, exe, mid, home) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
     (mid.trim() == "--home" && !exe.is_empty() && !home.is_empty()).then(|| (PathBuf::from(exe), PathBuf::from(home)))
 }
 
 /// 登录自启指向的安装目录。只认数据目录相同的那一条：用别的数据目录做测试时，不能找到正式的安装目录上去。
-fn autostart_dir(paths: &Paths) -> Option<PathBuf> {
+pub(crate) fn autostart_dir(paths: &Paths) -> Option<PathBuf> {
     let (exe, home) = parse_autostart(&agentctl::autostart_entry()?)?;
     same_path(&tidy(&home), &tidy(&paths.home)).then(|| exe.parent().map(Path::to_path_buf)).flatten()
 }
@@ -354,15 +354,15 @@ fn remove_old(plan: &Plan) -> Vec<&'static str> {
 }
 
 /// 正在运行的用户代理（本数据目录的那一个）。
-struct Agent {
+pub(crate) struct Agent {
     pid: u32,
     /// 它的程序所在目录；查不到时为 None
-    dir: Option<PathBuf>,
+    pub(crate) dir: Option<PathBuf>,
     /// 它有没有显示托盘图标：重启时照原样
     tray: bool,
 }
 
-fn running_agent() -> Option<Agent> {
+pub(crate) fn running_agent() -> Option<Agent> {
     let v = agentctl::call("status", Value::Null).ok()?;
     let pid = u32::try_from(v["pid"].as_u64()?).ok()?;
     let dir = process_path(pid).and_then(|p| p.parent().map(Path::to_path_buf));
@@ -394,7 +394,7 @@ fn wait_exit(pid: u32, timeout: Duration) -> bool {
 }
 
 /// 请用户代理退出，等到进程真的结束（内核随它停止、程序文件放开）。
-fn stop_agent(agent: &Agent) -> Result<()> {
+pub(crate) fn stop_agent(agent: &Agent) -> Result<()> {
     agentctl::call("stop", Value::Null).map_err(|e| anyhow::anyhow!("通知用户代理退出失败：{e}"))?;
     let deadline = Instant::now() + STOP_WAIT;
     while agentctl::running() {

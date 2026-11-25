@@ -10,6 +10,7 @@ mod consist;
 mod exitcmd;
 mod install;
 mod launch;
+mod uninstall;
 mod linecmd;
 mod report;
 mod sandbox;
@@ -185,6 +186,24 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// 卸载：删特权服务和守卫规则（弹出管理员确认）、停用户代理、取消登录自启、删快捷方式和安装目录、从 PATH 里去掉。数据目录留着
+    Uninstall {
+        /// 安装目录；不写时按运行中的用户代理、登录自启、默认位置来找
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// 不询问
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// 只看会做什么，不改动
+        #[arg(long)]
+        dry_run: bool,
+        /// 不动特权服务和守卫规则（测试用）
+        #[arg(long, hide = true)]
+        keep_guard: bool,
+        /// 在这个目录里找快捷方式，代替桌面（测试用）
+        #[arg(long, hide = true, value_name = "DIR")]
+        shortcut_dir: Option<PathBuf>,
+    },
     /// 把新编译的程序换进安装目录：需要时重启用户代理，没启动成功就换回原来的。换下来的那一版留着，--rollback 退回
     Upgrade {
         /// 新编译的程序所在目录；不写就是本程序所在的目录（直接运行新编译出来的 anchor.exe upgrade）
@@ -318,6 +337,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Repair
             | Cmd::Upgrade { dry_run: false, .. }
             | Cmd::Install { dry_run: false, .. }
+            | Cmd::Uninstall { dry_run: false, .. }
             | Cmd::Agent { action: AgentCmd::Start | AgentCmd::Install | AgentCmd::Uninstall }
     )
 }
@@ -400,6 +420,9 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Rules { format } => rules::print(&format)?,
         Cmd::Repair => sandbox::repair(&paths)?,
         Cmd::Install { to, no_path, dry_run } => install::run(&paths, &install::Args { to, no_path, dry_run })?,
+        Cmd::Uninstall { to, yes, dry_run, keep_guard, shortcut_dir } => {
+            uninstall::run(&paths, &uninstall::Args { to, yes, dry_run, keep_guard, shortcut_dir })?
+        }
         Cmd::Upgrade { dir, to, dry_run, service, rollback } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service, rollback })?,
     }
     Ok(0)
