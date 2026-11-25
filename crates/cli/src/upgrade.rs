@@ -32,7 +32,7 @@ const CLI: &str = "anchor.exe";
 const AGENT: &str = "anchor-agent.exe";
 const SVC: &str = "anchor-svc.exe";
 /// 新编译的目录里必须有的。
-const REQUIRED: [&str; 2] = [CLI, AGENT];
+pub(crate) const REQUIRED: [&str; 2] = [CLI, AGENT];
 /// 有就一起带上的：安装目录里的这一份只是 anchor service install / upgrade 用的安装源。
 const OPTIONAL: [&str; 1] = [SVC];
 
@@ -89,12 +89,12 @@ impl Plan {
     }
 }
 
-fn with_suffix(dir: &Path, name: &str, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(dir: &Path, name: &str, suffix: &str) -> PathBuf {
     dir.join(format!("{name}{suffix}"))
 }
 
 /// 绝对路径，去掉末尾的反斜杠。
-fn tidy(p: &Path) -> PathBuf {
+pub(crate) fn tidy(p: &Path) -> PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf()).components().collect()
 }
 
@@ -133,7 +133,7 @@ fn resolve(here: &Path, dir: Option<&Path>, to: Option<&Path>, agent_dir: Option
     Ok((from, to))
 }
 
-fn names() -> impl Iterator<Item = &'static str> {
+pub(crate) fn names() -> impl Iterator<Item = &'static str> {
     REQUIRED.into_iter().chain(OPTIONAL)
 }
 
@@ -195,7 +195,7 @@ fn plan(from: &Path, to: &Path) -> Result<Plan> {
         }
     }
     if !to.join(CLI).is_file() && !to.join(AGENT).is_file() {
-        bail!("{} 里没有 anchor.exe，也没有 anchor-agent.exe：这不像是安装目录。第一次安装请手工复制", to.display());
+        bail!("{} 里没有 anchor.exe，也没有 anchor-agent.exe：这不像是安装目录。第一次安装用 anchor install", to.display());
     }
     let mut items = Vec::new();
     for name in names() {
@@ -231,7 +231,7 @@ fn remove_staged(plan: &Plan) {
 }
 
 /// 复制一个文件，并核对复制的字节数。
-fn copy_whole(src: &Path, dst: &Path, name: &str) -> Result<()> {
+pub(crate) fn copy_whole(src: &Path, dst: &Path, name: &str) -> Result<()> {
     let n = std::fs::copy(src, dst).with_context(|| format!("复制 {} 到 {} 失败", src.display(), dst.display()))?;
     let want = std::fs::metadata(src)?.len();
     if n != want { bail!("{name} 只复制了 {n} 字节，应为 {want} 字节") } else { Ok(()) }
@@ -430,7 +430,7 @@ fn start_agent(exe: &Path, home: &Path, no_tray: bool) -> Result<u32> {
 }
 
 /// 文件的修改时间（复制时保留，所以就是编译时间），如 11-22 06:43。
-fn built(p: &Path) -> String {
+pub(crate) fn built(p: &Path) -> String {
     let ms = std::fs::metadata(p)
         .and_then(|m| m.modified())
         .ok()
