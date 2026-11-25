@@ -204,7 +204,7 @@ fn copy_and_register(manager: &ServiceManager, existing: Option<Service>, exe: &
     Ok(svc)
 }
 
-pub fn uninstall() -> Result<()> {
+pub fn uninstall(remove_rules: bool) -> Result<()> {
     win::require_admin()?;
     let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
     match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE) {
@@ -223,6 +223,12 @@ pub fn uninstall() -> Result<()> {
         let _ = std::fs::remove_dir(program_dir());
     }
     let _ = std::fs::remove_file(state_file());
-    println!("防火墙守卫规则保持不变（AI 程序仍然只能经通道联网）。要移除规则：anchor guard remove");
+    if remove_rules {
+        // 服务已经删了，不会再把规则补回来
+        let n = anchor_core::guard::remove_all()?;
+        println!("已移除 {n} 条防火墙守卫规则。");
+    } else {
+        println!("防火墙守卫规则保持不变（AI 程序仍然只能经通道联网）。要移除规则：anchor guard remove");
+    }
     Ok(())
 }

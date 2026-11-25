@@ -38,10 +38,13 @@ enum Cmd {
         #[arg(long, hide = true)]
         pause: bool,
     },
-    /// 停止并删除服务（需要管理员）；防火墙规则保留
+    /// 停止并删除服务（需要管理员）；防火墙规则保留，除非加 --remove-rules
     Uninstall {
         #[arg(long, hide = true)]
         pause: bool,
+        /// 把防火墙守卫规则也删掉（anchor uninstall 用）
+        #[arg(long)]
+        remove_rules: bool,
     },
     /// 把已安装的服务程序换成本程序这一份（需要管理员）；新的没启动成功就换回原来的
     Upgrade {
@@ -74,7 +77,8 @@ fn main() {
     // pause：出错时停住窗口。pause_ok：成功了也停住（安装、卸载的结果只显示在提权窗口里）
     let (r, pause, pause_ok) = match cli.cmd {
         Cmd::Install { user_sid, home, pause } => (install::install(user_sid, home), pause, pause),
-        Cmd::Uninstall { pause } => (install::uninstall(), pause, pause),
+        // anchor uninstall 调用时（--remove-rules）成功就关掉窗口，结果由它在原来的终端里报告
+        Cmd::Uninstall { pause, remove_rules } => (install::uninstall(remove_rules), pause, pause && !remove_rules),
         // 升级成功时窗口自己关掉：结果由调用它的 anchor 在原来的终端里报告
         Cmd::Upgrade { pause } => (upgrade::run(), pause, false),
         Cmd::Service => (run_dispatcher(), false, false),

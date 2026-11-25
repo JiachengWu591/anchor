@@ -27,20 +27,20 @@ pub struct Args {
 
 /// 用户环境变量在注册表里的位置（HKEY_CURRENT_USER 下）。
 const ENV_KEY: &str = "Environment";
-const PATH_VALUE: &str = "Path";
+pub(crate) const PATH_VALUE: &str = "Path";
 
-fn default_dir() -> Result<PathBuf> {
+pub(crate) fn default_dir() -> Result<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()).context("没有环境变量 LOCALAPPDATA：用 --to 写明安装目录")?;
     Ok(PathBuf::from(base).join("Programs").join("AIAnchor"))
 }
 
 /// PATH 里的一项，整理成可以比较的样子：去掉引号和末尾的反斜杠，展开 %变量%，不分大小写。
-fn norm(entry: &str) -> String {
+pub(crate) fn norm(entry: &str) -> String {
     let e = expand_env(entry.trim().trim_matches('"'), &[]);
     e.replace('/', "\\").trim_end_matches('\\').to_lowercase()
 }
 
-fn path_has(value: &str, dir: &Path) -> bool {
+pub(crate) fn path_has(value: &str, dir: &Path) -> bool {
     let want = norm(&dir.to_string_lossy());
     value.split(';').any(|e| !e.trim().is_empty() && norm(e) == want)
 }
@@ -58,7 +58,7 @@ fn path_with(value: &str, dir: &Path) -> String {
 }
 
 /// 注册表里的 Path：内容和类型。没有这一项时返回 None。读不懂的报错，不猜。
-fn read_path(key: &RegKey) -> Result<Option<(String, RegType)>> {
+pub(crate) fn read_path(key: &RegKey) -> Result<Option<(String, RegType)>> {
     let v = match key.get_raw_value(PATH_VALUE) {
         Ok(v) => v,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -93,19 +93,23 @@ fn add_to_path(key: &RegKey, dir: &Path) -> Result<PathChange> {
     if path_has(&old, dir) {
         return Ok(PathChange::Already);
     }
-    let new = path_with(&old, dir);
-    let bytes: Vec<u8> = new.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
-    key.set_raw_value(PATH_VALUE, &RegValue { bytes: bytes.into(), vtype }).context("写不了注册表里的 Path")?;
+    write_path(key, &path_with(&old, dir), vtype)?;
     Ok(PathChange::Added)
 }
 
-fn user_env(write: bool) -> Result<RegKey> {
+/// 写回 Path，类型由调用方给（沿用原来的）。结尾带一个 0，和系统写的一样。
+pub(crate) fn write_path(key: &RegKey, text: &str, vtype: RegType) -> Result<()> {
+    let bytes: Vec<u8> = text.encode_utf16().chain(std::iter::once(0)).flat_map(u16::to_le_bytes).collect();
+    key.set_raw_value(PATH_VALUE, &RegValue { bytes: bytes.into(), vtype }).context("写不了注册表里的 Path")
+}
+
+pub(crate) fn user_env(write: bool) -> Result<RegKey> {
     let flags = if write { KEY_READ | KEY_WRITE } else { KEY_READ };
     RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(ENV_KEY, flags).context("打不开用户的环境变量（注册表 HKCU\\Environment）")
 }
 
 /// 告诉正在运行的程序“环境变量变了”：资源管理器收到后，之后从它启动的终端才看得到新的 PATH。
-fn announce_env_change() {
+pub(crate) fn announce_env_change() {
     let what = wide("Environment");
     let mut result = 0usize;
     unsafe { SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, what.as_ptr() as LPARAM, SMTO_ABORTIFHUNG, 2000, &mut result) };

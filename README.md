@@ -8,7 +8,7 @@
 - **断联有记录、有归因**：AI 程序的连接出错就记进本机时间线，归到 Wi-Fi、宽带、VPN、内核、线路、出口或服务端。锁住久了会发通知，说卡在哪一段、该怎么做。
 - **常驻后台**：登录后自动运行，内核崩溃自动恢复。托盘图标显示状态，点开是面板。
 - **体检**：`anchor check` 查本地网络、线路、出口、AI 服务和守卫，还查出口 IP 的类型、DNS 有没有泄露，以及 AI 专用浏览器的 WebRTC、时区和语言是否和出口一致。
-- **安装、升级各一条命令**：`anchor install`、`anchor upgrade`。升级后新的起不来就换回原来的；换下来的那一版留着，可以退回。
+- **安装、升级、卸载各一条命令**：`anchor install`、`anchor upgrade`、`anchor uninstall`。升级后新的起不来就换回原来的；换下来的那一版留着，可以退回。
 
 不建 TUN，不改路由和系统代理，可以和必须常开的公司 VPN 同时用（见“与 VPN / 其他 TUN 共存”）。还没做的见“已知限制”。设计决定见 [docs/p1b-decisions.md](docs/p1b-decisions.md)，每一阶段的测试和真机记录见[测试报告](docs/test-report.md)。
 
@@ -171,10 +171,26 @@ AI Anchor 不建 TUN，也不改路由和系统代理，只开一个本机端口
 - `--dry-run` 只列出会做什么，不改动。
 - 也可以用已经装好的 `anchor` 来升级：`anchor upgrade <新编译的目录>`。这时它要换掉正在运行的自己：旧文件改名为 `anchor.exe.old` 留着，下次升级时删除。
 
+## 卸载
+
+在开始菜单打开的终端里运行 `anchor uninstall`。它先列出会做什么，回答 y 才开始：
+
+1. **删特权服务和防火墙守卫规则**：弹出一次管理员确认。取消或失败的话，后面的都不做。规则和服务一起删：只删服务、规则留着的话，AI 程序就一直只能连本机。规则删掉后，AI 程序不经 AI Anchor 也能直接上网。
+2. **停用户代理、取消登录自启**：只停从这个安装目录运行的用户代理，只删指向这个安装目录的登录自启。
+3. **删快捷方式**：桌面上指向这个安装目录的“… - AI Anchor”快捷方式。
+4. **删安装目录里 AI Anchor 自己的文件**：三个程序、升级留下的上一版 `previous\` 和 `.old` / `.new`。目录里有别的文件（比如你自己放的备份）就不碰，目录也因此留着。正在运行的 `anchor.exe` 删不掉，等命令结束后由一个隐藏的 PowerShell 删。
+5. **从用户的 PATH 里去掉安装目录**：别的项原样留着。
+
+数据目录（`%LOCALAPPDATA%\AIAnchor`：配置、时间线、日志、sing-box）不删，结束时会写明在哪里；不要了就自己删。
+
+- 安装目录不用写：用户代理在运行时就是它所在的目录，没在运行时看登录自启，再看默认位置。都没有就拒绝，要用 `--to <安装目录>` 写明。编译目录（`target\release` 这种）一律拒绝。
+- `--dry-run` 只列出会做什么，不改动；`-y` 不询问。
+
 ## 命令
 
 | 命令 | 作用 |
 |---|---|
+| `anchor uninstall [--to 安装目录] [--dry-run] [-y]` | 卸载：删特权服务和守卫规则（弹出管理员确认）、停用户代理、取消登录自启、删快捷方式和安装目录里的程序、从 PATH 里去掉。数据目录留着。见上面“卸载” |
 | `anchor install [--to 安装目录] [--no-path] [--dry-run]` | 第一次安装：把新编译的程序复制到安装目录，并把安装目录加进用户的 PATH。要运行新编译出来的那个 `anchor.exe`。已经装过的用 `anchor upgrade` |
 | `anchor init` | 生成示例配置 `anchor.toml` |
 | `anchor gen` | 生成 sing-box 配置；找得到 sing-box 时顺带运行 `sing-box check` |
@@ -367,9 +383,13 @@ AI 专用浏览器的启动参数如下。它是一个独立实例，用户日�
 - **插件模式还没做**。
 - **`anchor install` 只复制程序、改 PATH**：
   - 没有发布编译好的版本，要自己编译。sing-box 也要自己下载。
-  - 没有卸载命令。要卸载：`anchor service uninstall`、`anchor agent uninstall`，删掉安装目录，再从用户的 PATH 里去掉那一项（“编辑账户的环境变量”）。
+  - 卸载用 `anchor uninstall`，见上面“卸载”。
   - PATH 只在末尾加一项。注册表里的 Path 读不懂时（不是文字类型，或者不是合法的文字）不改，装完会提示自己加。
   - 改的是用户的 PATH，不是系统的。已经开着的终端看不到，要新开一个；个别程序要注销再登录才看得到。
+- **`anchor uninstall` 只收拾 AI Anchor 自己放的东西**：
+  - 快捷方式只看桌面：用 `anchor shortcut --dir` 放到别处的不会被删。
+  - 数据目录不删。AI 专用浏览器的配置目录、被 MSIX 应用重定向的私有副本也在数据目录那边，同样不删。
+  - 在 Claude 桌面版等 MSIX 应用的终端里运行会被拒绝（和别的会改东西的命令一样）。
 - **`anchor upgrade` 只换程序文件**：
   - 不下载东西，新程序要自己编译。
   - 不改配置。特权服务默认不更新，要加 `--service`（弹出管理员确认）。
@@ -394,7 +414,7 @@ Cargo workspace，四个 crate：
 | `crates/core`（anchor-core） | 库 | 配置、sing-box 配置生成、网络探测、出口锁定状态机（`exitlock`）、网络变化通知（`netwatch`）、断联解析与归因（`disconnect`）、断联统计（`report`，命令行和面板共用）、上行网卡与绕开 VPN 的探测（`uplink`）、守卫计算与增量刷新、程序发现、命名管道、时间线（`timeline` 特性）、Windows 系统调用封装 |
 | `crates/agent`（anchor-agent） | `anchor-agent.exe` | 会话（内核 + 看门狗 + 出口核对 + 持续探测）、断联采集、托盘、面板（`panel`：本机网页服务和页面）、本机接口、向服务同步守卫变化 |
 | `crates/svc`（anchor-svc） | `anchor-svc.exe` | 服务注册与安装、原地升级（`upgrade`）、守卫维护循环、注册表变更监视 |
-| `crates/cli`（anchor-cli） | `anchor.exe` | 全部命令（`init`、`check`、`launch`、`agent`、`service`、`exit`、`line`、`report`、`install`、`upgrade`……）；一致性检测（`consist`） |
+| `crates/cli`（anchor-cli） | `anchor.exe` | 全部命令（`init`、`check`、`launch`、`agent`、`service`、`exit`、`line`、`report`、`install`、`upgrade`、`uninstall`……）；一致性检测（`consist`） |
 
 ## 测试
 

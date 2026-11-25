@@ -25,6 +25,27 @@ pub fn run(script: &str) -> Result<Output> {
     cmd.output().context("无法启动 powershell.exe")
 }
 
+/// 在后台启动脚本，不等它结束：不开窗口，不接标准输入输出，脱离调用方所在的作业对象（终端关掉也继续运行）。
+pub fn spawn_detached(script: &str) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::Stdio;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let b64 = base64::engine::general_purpose::STANDARD.encode(utf16);
+    let spawn = |flags: u32| {
+        Command::new(crate::win::system32(r"WindowsPowerShell\v1.0\powershell.exe"))
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", &b64])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(flags)
+            .spawn()
+    };
+    spawn(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| spawn(CREATE_NO_WINDOW)).context("无法启动 powershell.exe")?;
+    Ok(())
+}
+
 /// 运行脚本，失败时把 stderr 作为错误返回。
 pub fn run_ok(script: &str) -> Result<String> {
     let out = run(script)?;

@@ -26,7 +26,7 @@ fn quote_arg(s: &str) -> String {
 }
 
 /// 以管理员身份运行 anchor-svc.exe（弹出 UAC 确认），等待结束并返回退出码。
-fn run_elevated(exe: &Path, params: &str) -> Result<u32> {
+pub(crate) fn run_elevated(exe: &Path, params: &str) -> Result<u32> {
     let verb = win::wide("runas");
     let file = win::wide(&exe.to_string_lossy());
     let params = win::wide(params);
