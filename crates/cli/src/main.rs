@@ -8,6 +8,7 @@ mod agentctl;
 mod check;
 mod consist;
 mod exitcmd;
+mod install;
 mod launch;
 mod linecmd;
 mod report;
@@ -172,6 +173,18 @@ enum Cmd {
     },
     /// 把被 MSIX 应用（如 Claude 桌面版）重定向到其私有目录的数据目录副本合并回原位置
     Repair,
+    /// 第一次安装：把新编译的程序复制到安装目录，并把安装目录加进用户的 PATH。已经装过的用 upgrade
+    Install {
+        /// 安装目录；不写就是 %LOCALAPPDATA%\Programs\AIAnchor
+        #[arg(long, value_name = "DIR")]
+        to: Option<PathBuf>,
+        /// 不改 PATH
+        #[arg(long)]
+        no_path: bool,
+        /// 只看会做什么，不改动
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 把新编译的程序换进安装目录：需要时重启用户代理，没启动成功就换回原来的。换下来的那一版留着，--rollback 退回
     Upgrade {
         /// 新编译的程序所在目录；不写就是本程序所在的目录（直接运行新编译出来的 anchor.exe upgrade）
@@ -304,6 +317,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Browser { .. }
             | Cmd::Repair
             | Cmd::Upgrade { dry_run: false, .. }
+            | Cmd::Install { dry_run: false, .. }
             | Cmd::Agent { action: AgentCmd::Start | AgentCmd::Install | AgentCmd::Uninstall }
     )
 }
@@ -385,6 +399,7 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Shortcut { target, dir } => launch::create_shortcut(&paths, &target, dir.as_deref())?,
         Cmd::Rules { format } => rules::print(&format)?,
         Cmd::Repair => sandbox::repair(&paths)?,
+        Cmd::Install { to, no_path, dry_run } => install::run(&paths, &install::Args { to, no_path, dry_run })?,
         Cmd::Upgrade { dir, to, dry_run, service, rollback } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service, rollback })?,
     }
     Ok(0)
