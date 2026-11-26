@@ -97,14 +97,20 @@ AI Anchor 不建 TUN，也不改路由和系统代理，只开一个本机端口
 
 ## 快速开始
 
-1. 构建并安装：
+1. 拿到程序并安装。两种办法，任选一种：
+   - **下载编译好的**：在 GitHub 的 Releases 页面下载 `ai-anchor-v…-windows-x64.zip`，用同一页的 `SHA256SUMS.txt` 核对（PowerShell 里运行 `Get-FileHash <下载的文件>`）。解压后，在开始菜单打开的终端里运行解压出来的 `anchor.exe install`。
+     - 这些程序没有代码签名，Windows 会把下载来的程序标成“来自网络”，运行时弹出 SmartScreen 提示。核对过之后，可以在解压前打开 zip 的“属性”，勾选“解除锁定”。
+   - **自己编译**：
 
-   ```
-   cargo build --release --workspace
-   target\release\anchor.exe install
-   ```
+     ```
+     cargo build --release --workspace
+     target\release\anchor.exe install
+     ```
 
-   - `target\release\` 下会生成三个程序：`anchor.exe`、`anchor-agent.exe`、`anchor-svc.exe`。
+     `target\release\` 下会生成三个程序：`anchor.exe`、`anchor-agent.exe`、`anchor-svc.exe`。
+
+   之后的说明两种办法都一样：
+
    - `install` 把它们复制到 `%LOCALAPPDATA%\Programs\AIAnchor\`，并把这个目录加到用户的 PATH 末尾。之后**新开一个终端**，`anchor` 这个命令才认得。
    - 换个地方装：`--to <目录>`。不想让它改 PATH：`--no-path`（之后的命令要写完整路径）。先看会做什么：`--dry-run`。
    - 它只管程序文件和 PATH；下面的第 2～6 步它不做，结束时会把它们列出来。
@@ -143,7 +149,7 @@ AI Anchor 不建 TUN，也不改路由和系统代理，只开一个本机端口
 
 ## 升级
 
-重新编译之后，在开始菜单打开的终端里，运行新编译出来的那个 `anchor.exe`：
+重新编译之后（或者下载了新版本、解压之后），在开始菜单打开的终端里，运行新编译出来（或解压出来）的那个 `anchor.exe`：
 
 ```
 <项目目录>\target\release\anchor.exe upgrade
@@ -381,8 +387,9 @@ AI 专用浏览器的启动参数如下。它是一个独立实例，用户日�
 - **WebRTC 只检测 AI 专用浏览器的启动参数**：用的是临时配置目录，你在 AI 专用浏览器里装的扩展不在检测范围内；桌面客户端也不检测。
 - **云端锚点还没做**：AI 会话仍在这台电脑上运行，本地断网时回答和任务会中断。AI Anchor 保证的是断网时不直连、恢复后核对出口再放行。
 - **插件模式还没做**。
+- **发布的程序没有代码签名**：下载来的程序运行时 Windows 会弹 SmartScreen 提示；装特权服务、升级服务、卸载时的管理员确认窗口显示“未知发布者”。能核对的只有 Releases 页面上的 `SHA256SUMS.txt`。
 - **`anchor install` 只复制程序、改 PATH**：
-  - 没有发布编译好的版本，要自己编译。sing-box 也要自己下载。
+  - sing-box 要自己下载：它是 GPL-3.0，不随本项目分发，发布的 zip 里也没有。
   - 卸载用 `anchor uninstall`，见上面“卸载”。
   - PATH 只在末尾加一项。注册表里的 Path 读不懂时（不是文字类型，或者不是合法的文字）不改，装完会提示自己加。
   - 改的是用户的 PATH，不是系统的。已经开着的终端看不到，要新开一个；个别程序要注销再登录才看得到。
@@ -404,6 +411,13 @@ AI 专用浏览器的启动参数如下。它是一个独立实例，用户日�
 - **线路探测是轮询的**：当前线路断开后，最坏要等一个 `watch_interval` 加一次探测超时（默认约 3～5.5 秒）才换线；AI 程序的连接先出错的话，记到断联后会立刻探测，实测不到 1 秒换线。每次探测经线路请求一次 `probe_url`，流量很小。`probe_url` 可以是 `http://` 地址（省掉 TLS 握手）：sing-box 的测速接口会把小写 `http://` 开头的地址换成它的默认地址，程序发给它时把协议名写成大写来避开，这是按 1.14 实测的行为。
 - **线路探测测的是“线路 + 测速地址”**：测速地址本身慢或被拦时，所有线路都会显得不通。实测晚高峰经 VPN 访问默认的测速地址，2.5 秒的超时经常不够；线路多半也经过同一条拥堵的路，这时换线帮不上忙，可以把 `probe_url` 换成离线路服务器近的地址。
 - 项目所在路径过长时，MSVC 链接器可能报 `LNK1104`（超过 260 字符）。把项目放到短路径，或设置 `CARGO_TARGET_DIR`。
+
+## 发布新版本
+
+1. 改 `Cargo.toml` 里的 `version`，编译一次让 `Cargo.lock` 跟着变（CI 用 `--locked`，两边对不上会失败），合并进 `main`。
+2. 在 `main` 上打标签并推送，例如 `git tag v0.3.0`、`git push origin v0.3.0`。
+3. GitHub Actions 的 Release 工作流（`.github/workflows/release.yml`）编译 release 版、跑单元测试、打包，建一个**草稿**版本，附上 zip 和 `SHA256SUMS.txt`。标签和程序报的版本对不上就失败，不建草稿。
+4. 在 GitHub 的 Releases 页面看过草稿（附件、说明），再点发布。工作流自己不会公开发布。
 
 ## 代码结构
 
