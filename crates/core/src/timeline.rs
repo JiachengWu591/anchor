@@ -494,6 +494,7 @@ pub fn describe(e: &Event) -> (&'static str, String) {
         "exit_switch" => ("出口切换", format!("出口 {} → {}（手动切换）；AI 服务看到的 IP 随之改变", s(d, "from"), s(d, "to"))),
         "uplink_change" => ("换网络", format!("上行网卡变了：{} → {}", uplink_name(s(d, "from")), uplink_name(s(d, "to")))),
         "config_error" => ("配置错误", s(d, "message").to_string()),
+        "update_available" => ("新版本", format!("GitHub 上有新版本 {}（现在 {}）；已发通知", s(d, "version"), s(d, "current"))),
         _ => ("其他", format!("{} {}", e.kind, e.detail)),
     }
 }

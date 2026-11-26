@@ -284,6 +284,7 @@ button.primary { margin-top: 10px; width: 100%; background: var(--accent); borde
   white-space: nowrap;
 }
 button.link:hover { text-decoration: underline; }
+.update { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; padding: 0 4px; font-size: 13px; color: var(--muted); }
 details .link { margin-top: 8px; }
 
 .toast {

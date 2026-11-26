@@ -422,6 +422,7 @@ fn state(sh: &Arc<Shared>, srv: &Server) -> Value {
         "culprit": culprit,
         "facts": facts,
         "controls": controls,
+        "update": view::update_line(anchor_core::VERSION, sh.newer().as_deref()),
     })
 }
 
@@ -467,6 +468,13 @@ fn action(sh: &Arc<Shared>, body: &[u8]) -> Response {
         "line.unpin" => line_reply(crate::api::line_cmd(sh, LineCmd::Unpin)),
         "exit.use" => exit_use(sh, arg),
         "baseline" => run(sh, &["baseline"], "已在新窗口里测量现在的出口。看清测到的 IP，在那个窗口里确认之后才会登记为基线"),
+        "update.open" => match sh.newer() {
+            None => Response::error(409, "没有比现在更新的版本"),
+            Some(v) => match actions::open_release(&v) {
+                Ok(()) => done(&format!("已在浏览器里打开 {v} 的下载页。下载解压后，在开始菜单打开的终端里运行里面的 anchor.exe upgrade")),
+                Err(e) => Response::error(503, &format!("{e:#}")),
+            },
+        },
         _ => Response::error(400, "没有这个操作"),
     }
 }

@@ -92,6 +92,8 @@ pub struct Shared {
     health: Mutex<LocalHealth>,
     /// 面板的本机网页服务：用到时才启动
     pub panel: crate::panel::Panel,
+    /// GitHub 上比自己新的正式版本（新版本提醒查到的）；没有时为空
+    newer: Mutex<Option<String>>,
     st: Mutex<Status>,
     notes: Mutex<VecDeque<Note>>,
     stop_reason: Mutex<String>,
@@ -102,6 +104,7 @@ pub struct Shared {
 impl Shared {
     pub fn new(paths: Paths, tl: Timeline, tray: bool) -> Self {
         let st = Status { guard: GuardView { svc: "unknown".into(), ..Default::default() }, ..Default::default() };
+        let newer = anchor_core::update::State::load(&paths).newer(anchor_core::VERSION).map(String::from);
         Self {
             paths,
             tl,
@@ -116,6 +119,7 @@ impl Shared {
             line_kick: AtomicBool::new(false),
             lines_view: Mutex::new(None),
             health: Mutex::new(LocalHealth::default()),
+            newer: Mutex::new(newer),
             panel: crate::panel::Panel::default(),
             st: Mutex::new(st),
             notes: Mutex::new(VecDeque::new()),
@@ -164,6 +168,15 @@ impl Shared {
 
     pub fn config(&self) -> Option<Arc<Config>> {
         self.cfg.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// 比自己新的正式版本（有的话）。
+    pub fn newer(&self) -> Option<String> {
+        self.newer.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_newer(&self, v: Option<&str>) {
+        *self.newer.lock().unwrap_or_else(|e| e.into_inner()) = v.map(String::from);
     }
 
     pub fn take_notes(&self) -> Vec<Note> {

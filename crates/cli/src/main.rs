@@ -12,6 +12,7 @@ mod install;
 mod launch;
 mod uninstall;
 mod linecmd;
+mod newver;
 mod report;
 mod sandbox;
 mod svcctl;
@@ -220,6 +221,9 @@ enum Cmd {
         /// 退回上一版：把上次升级换下来的那一版（安装目录的 previous\ 里）换回去；再运行一次就换回来
         #[arg(long, conflicts_with = "dir")]
         rollback: bool,
+        /// 只查 GitHub 上有没有新的正式版本，不下载，也不安装
+        #[arg(long, conflicts_with_all = ["dir", "to", "dry_run", "service", "rollback"])]
+        check: bool,
     },
 }
 
@@ -335,7 +339,7 @@ fn unsafe_in_package(cmd: &Cmd) -> bool {
             | Cmd::Launch { .. }
             | Cmd::Browser { .. }
             | Cmd::Repair
-            | Cmd::Upgrade { dry_run: false, .. }
+            | Cmd::Upgrade { dry_run: false, check: false, .. }
             | Cmd::Install { dry_run: false, .. }
             | Cmd::Uninstall { dry_run: false, .. }
             | Cmd::Agent { action: AgentCmd::Start | AgentCmd::Install | AgentCmd::Uninstall }
@@ -423,7 +427,10 @@ fn real_main(cli: Cli) -> Result<i32> {
         Cmd::Uninstall { to, yes, dry_run, keep_guard, shortcut_dir } => {
             uninstall::run(&paths, &uninstall::Args { to, yes, dry_run, keep_guard, shortcut_dir })?
         }
-        Cmd::Upgrade { dir, to, dry_run, service, rollback } => upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service, rollback })?,
+        Cmd::Upgrade { check: true, .. } => newver::check(&paths)?,
+        Cmd::Upgrade { dir, to, dry_run, service, rollback, check: false } => {
+            upgrade::run(&paths, &upgrade::Args { dir, to, dry_run, service, rollback })?
+        }
     }
     Ok(0)
 }
@@ -702,6 +709,7 @@ fn status(paths: &Paths) -> Result<()> {
         },
         Err(e) => println!("守卫  特权服务状态未知：{e}"),
     }
+    println!("{}", newver::status_line(paths, cfg.as_ref().ok()));
     if agent.is_some() {
         println!("时间线  anchor timeline");
     }
