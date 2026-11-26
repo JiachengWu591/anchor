@@ -66,6 +66,15 @@ pub fn open_url(url: &str) -> Result<()> {
     if !url.starts_with("http://127.0.0.1:") {
         bail!("只打开本机面板的地址");
     }
+    shell_open(url)
+}
+
+/// 用默认浏览器打开某个版本在 GitHub 上的发布页。
+pub fn open_release(version: &str) -> Result<()> {
+    shell_open(&anchor_core::update::release_page(version).context("版本号格式不对")?)
+}
+
+fn shell_open(url: &str) -> Result<()> {
     let (verb, target) = (wide("open"), wide(url));
     let r = unsafe { ShellExecuteW(null_mut(), verb.as_ptr(), target.as_ptr(), null(), null(), SW_SHOWNORMAL) };
     // 返回值大于 32 表示成功

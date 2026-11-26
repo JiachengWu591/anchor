@@ -176,11 +176,17 @@ function renderControls(c) {
   }
 }
 
+function renderUpdate(u) {
+  $('update').hidden = !u;
+  $('update-text').textContent = u ? u.text : '';
+}
+
 function renderState(st) {
-  const key = JSON.stringify([st.channel, st.path, st.culprit, st.facts, st.controls]);
+  const key = JSON.stringify([st.channel, st.path, st.culprit, st.facts, st.controls, st.update]);
   if (key === lastState) return;
   lastState = key;
   renderChannel(st.channel);
+  renderUpdate(st.update);
   renderPath(st.path, st.culprit);
   renderFacts(st.facts);
   renderControls(st.controls || { baseline_needed: false, lines: null, exits: [] });

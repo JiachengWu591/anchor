@@ -395,6 +395,11 @@ pub struct About<'a> {
     pub home: String,
 }
 
+/// 有新版本时，面板顶部的一行。
+pub fn update_line(current: &str, newer: Option<&str>) -> Option<Value> {
+    newer.map(|v| json!({ "version": v, "text": format!("有新版本 {v}（现在用的是 {current}）") }))
+}
+
 /// 面板底部的几行说明：(名称, 内容)。
 pub fn facts(st: &Status, a: &About) -> Vec<(&'static str, String)> {
     let mut v = Vec::new();
@@ -589,6 +594,12 @@ pub fn history(tl: &Timeline, now: i64) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_line_only_when_newer() {
+        assert_eq!(update_line("0.3.0", None), None);
+        assert_eq!(update_line("0.3.0", Some("0.4.0")).unwrap()["text"], "有新版本 0.4.0（现在用的是 0.3.0）");
+    }
     use anchor_core::exitlock::View as ExitView;
 
     const NOW: i64 = 1_000_000_000;

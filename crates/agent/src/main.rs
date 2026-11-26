@@ -14,6 +14,7 @@ mod panel;
 mod session;
 mod shared;
 mod tray;
+mod update;
 
 use anchor_core::config::Paths;
 use anchor_core::ipc::{self, AlreadyRunning};
@@ -117,6 +118,10 @@ fn real_main(args: Args) -> Result<()> {
     {
         let sh = sh.clone();
         thread::spawn(move || maintenance(sh));
+    }
+    {
+        let sh = sh.clone();
+        thread::spawn(move || update::run(sh));
     }
 
     if sh.tray {

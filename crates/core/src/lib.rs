@@ -24,6 +24,7 @@ pub mod stall;
 #[cfg(feature = "timeline")]
 pub mod timeline;
 pub mod uplink;
+pub mod update;
 pub mod util;
 pub mod watch;
 pub mod win;

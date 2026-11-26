@@ -38,6 +38,8 @@ impl Paths {
     /// anchor line pin 固定的线路名（重启后仍然有效）
     pub fn line_pin(&self) -> PathBuf { self.home.join("line.pin") }
     pub fn agent_log(&self) -> PathBuf { self.log_dir().join("agent.log") }
+    /// 新版本提醒：上次查到的最新版本、通知过哪个版本
+    pub fn update_state(&self) -> PathBuf { self.home.join("update.json") }
 }
 
 /// 一个 sing-box 出站：除 name 外的字段原样透传给 sing-box。
@@ -195,6 +197,17 @@ impl Default for DnsCfg {
     fn default() -> Self { Self { exit_doh: "1.1.1.1".into() } }
 }
 
+/// 新版本提醒。
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateCfg {
+    /// 用户代理每天查一次 GitHub 上有没有新的正式版本。false 不查（anchor upgrade --check 照样能手动查）
+    pub check: bool,
+}
+impl Default for UpdateCfg {
+    fn default() -> Self { Self { check: true } }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CheckCfg {
@@ -247,6 +260,8 @@ pub struct Config {
     pub check: CheckCfg,
     #[serde(default)]
     pub dns: DnsCfg,
+    #[serde(default)]
+    pub update: UpdateCfg,
     /// 配置里的所有出口（主出口在前），以及现在用的是哪个。由 select_exit 填写
     #[serde(skip)]
     pub exits: Vec<ExitEntry>,
@@ -612,6 +627,11 @@ extra_programs = []
 # 代理型出口（socks、shadowsocks……）由出口服务器解析域名，不受这项影响。
 exit_doh = "1.1.1.1"
 
+# 新版本提醒：用户代理每天查一次 GitHub 上有没有新的正式版本，有就发一次通知。只查，不下载，也不安装。
+# 先直接连 GitHub，连不上再经出口查。不想让它查，去掉下面两行开头的 #（anchor upgrade --check 照样能手动查）。
+# [update]
+# check = false
+
 [core]
 # sing-box.exe 路径；留空时依次查找 <数据目录>\bin、anchor.exe 同目录、PATH。
 path = ""
@@ -637,6 +657,9 @@ mod tests {
         assert!(!cfg.exit.outbound.contains_key("name"));
         assert_eq!(cfg.core.api_secret, "abc");
         assert!(!cfg.guard.allow_fakeip, "FakeIP 段默认不放行");
+        assert!(cfg.update.check, "示例里 [update] 是注释掉的：默认查，旧版本也读得了这份配置");
+        let off = example("abc").replace("# [update]\n# check = false", "[update]\ncheck = false");
+        assert!(!Config::parse(&off).unwrap().update.check);
     }
 
     #[test]
@@ -645,6 +668,8 @@ mod tests {
         assert_eq!(cfg.proxy_url(), "http://127.0.0.1:17890");
         assert_eq!(cfg.switch.lines, LineMode::Auto);
         assert!(cfg.lines.is_empty());
+        assert!(cfg.update.check, "没写 [update] 时默认查新版本");
+        assert!(!Config::parse(&format!("{MIN}[update]\ncheck = false\n")).unwrap().update.check);
     }
 
     #[test]

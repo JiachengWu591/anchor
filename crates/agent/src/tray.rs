@@ -27,6 +27,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 const WM_TRAY: u32 = WM_APP + 1;
 const ID_STATUS: usize = 1;
 const ID_PANEL: usize = 2;
+const ID_UPDATE: usize = 3;
 const ID_TIMELINE: usize = 10;
 const ID_CHECK: usize = 11;
 const ID_FOLDER: usize = 12;
@@ -137,6 +138,10 @@ fn show_menu(hwnd: HWND) {
             AppendMenuW(m, flags, id, w.as_ptr());
         };
         item(MF_STRING | MF_GRAYED, ID_STATUS, &format!("AI Anchor：{text}"));
+        let newer = sh.newer();
+        if let Some(v) = &newer {
+            item(MF_STRING, ID_UPDATE, &format!("下载新版本 {v}（打开下载页）"));
+        }
         AppendMenuW(m, MF_SEPARATOR, 0, null());
         item(MF_STRING, ID_PANEL, "打开面板");
         item(MF_STRING, ID_TIMELINE, "查看时间线（最近 24 小时）");
@@ -155,6 +160,13 @@ fn show_menu(hwnd: HWND) {
         DestroyMenu(m);
         match cmd {
             ID_PANEL => open_panel(),
+            ID_UPDATE => {
+                if let Some(v) = &newer
+                    && let Err(e) = actions::open_release(v)
+                {
+                    sh.notify(Level::Error, "打不开下载页", &format!("{e:#}"));
+                }
+            }
             ID_TIMELINE => run_cli(&["timeline", "--since", "24h"]),
             ID_REPORT => run_cli(&["report", "--since", "7d"]),
             ID_CHECK => run_cli(&["check"]),
