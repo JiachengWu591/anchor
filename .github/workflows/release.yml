@@ -1,0 +1,141 @@
+name: Release
+
+# 推一个版本标签（例如 v0.2.0）时：编译 release 版、跑单元测试、打包，然后建一个**草稿**版本。
+# 草稿只有仓库的维护者看得到，看过附件没问题，再在 GitHub 上点“发布”。这个工作流自己不会公开发布任何东西。
+#
+# 改这个文件的 PR 也会跑编译、测试和打包（不建版本），改动在合并前就能跑一遍。
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths: ['.github/workflows/release.yml']
+
+# 默认只读。只有建草稿那一步要写权限，单独给。
+permissions:
+  contents: read
+
+# 同一个标签不并行跑两次；正在建版本的不取消。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build and package (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      # 按提交号固定，不跟着标签走。
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust (stable)
+        run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - name: Use stable
+        run: rustup default stable
+
+      - name: Show versions
+        run: cargo --version --verbose
+
+      # --locked：Cargo.lock 和 Cargo.toml 对不上时失败，不悄悄换依赖的版本。
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      # 用 release 配置再跑一遍单元测试：发出去的是这个配置编出来的程序。
+      - name: Test
+        run: cargo test --release --workspace --locked
+
+      # 标签必须和程序自己报的版本一致，免得发出去的 v0.3.0 里装的是 0.2.0。
+      - name: Check version
+        id: version
+        shell: pwsh
+        run: |
+          $v = ((& target\release\anchor.exe --version) -join '').Trim() -replace '^anchor ', ''
+          if ($v -notmatch '^\d+\.\d+\.\d+') { throw "看不懂程序报的版本：$v" }
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$v") {
+            throw "标签 $env:GITHUB_REF_NAME 和程序的版本 $v 对不上：要么改 Cargo.toml 里的 version，要么打 v$v"
+          }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "程序版本 $v"
+
+      # 打包：三个程序、LICENSE、README 放在 zip 的最外层。另附一份 SHA256，核对 zip 和里面的三个程序。
+      # 不带 sing-box：它是 GPL-3.0，AI Anchor 只当独立程序调用，不随本项目分发。
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "ai-anchor-v${{ steps.version.outputs.version }}-windows-x64"
+          $dir = "dist\$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\anchor.exe, target\release\anchor-agent.exe, target\release\anchor-svc.exe, LICENSE, README.md $dir
+          Compress-Archive -Path "$dir\*" -DestinationPath "dist\$name.zip"
+          $files = @(Get-Item "dist\$name.zip") + @(Get-ChildItem "$dir\*.exe" | Sort-Object Name)
+          $files | ForEach-Object { '{0}  {1}' -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $_.Name } |
+            Set-Content -Encoding ascii dist\SHA256SUMS.txt
+          Get-Content dist\SHA256SUMS.txt
+          Get-ChildItem dist -File | ForEach-Object { '{0}  {1:N0} bytes' -f $_.Name, $_.Length }
+
+      - name: Upload package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Create draft release
+    needs: build
+    # 只在推标签时建版本；PR 只跑上面的打包
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download package
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: package
+          path: dist
+
+      - name: Write release notes
+        run: |
+          cat > notes.md <<'EOF'
+          Windows x64。没有代码签名。
+
+          ## 第一次安装
+
+          1. 下载 `ai-anchor-…-windows-x64.zip`。可以先用 `SHA256SUMS.txt` 核对：在 PowerShell 里运行 `Get-FileHash <下载的文件>`，结果应该和里面那一行一样（大小写不论）。
+          2. 解压。这个版本没有代码签名，Windows 会把下载来的程序标成“来自网络”，运行时弹出 SmartScreen 提示。核对过之后，可以在解压前打开 zip 的“属性”，勾选“解除锁定”。
+          3. 在开始菜单打开的终端里，运行解压出来的 `anchor.exe install`。它把程序装到 `%LOCALAPPDATA%\Programs\AIAnchor\`，并加进用户的 PATH。
+          4. 按它结束时列出的步骤继续：下载 sing-box、`anchor init`、`anchor agent install`、`anchor baseline`、`anchor service install`。
+
+          ## 已经装过
+
+          在解压出来的目录里运行 `anchor.exe upgrade`。换下来的那一版留着，`anchor upgrade --rollback` 可以退回。
+
+          ## 不包含
+
+          sing-box（GPL-3.0）不随本项目分发，从 sing-box 官方的 release 下载 Windows 版（1.12 或更高）。
+
+          完整说明见仓库的 README。
+          EOF
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/*.zip dist/SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft \
+            --verify-tag \
+            --title "AI Anchor $GITHUB_REF_NAME" \
+            --notes-file notes.md
